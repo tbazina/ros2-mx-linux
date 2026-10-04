@@ -8,5 +8,11 @@
   },
   "local_rosdep_mappings": [],
   "packages_ignore": [],
-  "patches": []
+  "patches": [
+    {
+      "repository": "ros2/launch",
+      "file": "patches/launch-testing-python311-retry.patch",
+      "reason": "Python 3.11 retry compatibility, based on upstream guarded outcome handling; preserve preexisting TestResult failures."
+    }
+  ]
 }

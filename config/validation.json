@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "scope": "local",
+  "lint_tests": [
+    "test_flake8",
+    "test_pycodestyle",
+    "test_pep257",
+    "test_mypy",
+    "test_uncrustify",
+    "test_cpplint",
+    "test_cppcheck",
+    "test_clang_format",
+    "test_clang_tidy",
+    "test_copyright",
+    "test_lint_cmake",
+    "test_xmllint",
+    "test_pyflakes"
+  ],
+  "lint_labels": [
+    "flake8",
+    "pycodestyle",
+    "pep257",
+    "mypy",
+    "uncrustify",
+    "cpplint",
+    "cppcheck",
+    "clang_format",
+    "clang_tidy",
+    "copyright",
+    "lint_cmake",
+    "xmllint",
+    "pyflakes"
+  ],
+  "network_only_tests": [
+    {
+      "package": "ros2multicast",
+      "classname": "ros2multicast.ros2multicast.test.test_api",
+      "name": "test_api",
+      "revision": "1e9f841df8d3fd10f3987ab0b4319cd3a94f6c52",
+      "message_prefix": "AssertionError: assert b'test_api' == None",
+      "reason": "Default-interface multicast is outside local certification; loopback DDS checks remain mandatory."
+    }
+  ],
+  "cyclone_config": "cyclonedds-loopback.xml"
+}

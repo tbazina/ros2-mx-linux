@@ -1,0 +1,36 @@
+--- a/launch_testing/launch_testing/markers.py
++++ b/launch_testing/launch_testing/markers.py
+@@ -43,14 +43,31 @@
+         def _wrapper(self, *args, **kwargs):
+             n = times
+             while n > 1:
++                # Python 3.11 moved outcome errors to TestResult. Snapshot only
++                # this attempt's additions; earlier test failures must survive.
++                outcome = getattr(self, '_outcome', None)
++                result = getattr(outcome, 'result', None)
++                pending = []
++                for owner, attribute in (
++                    (outcome, 'errors'), (result, 'errors'), (result, 'failures')
++                ):
++                    values = getattr(owner, attribute, None)
++                    if isinstance(values, list):
++                        pending.append((values, len(values)))
++                previous_success = getattr(outcome, 'success', True)
++                previous_stop = getattr(result, 'shouldStop', None)
+                 try:
+                     ret = func(self, *args, **kwargs)
+                     if isinstance(self, unittest.TestCase):
+                         assert self._outcome.success
+                     return ret
+                 except AssertionError:
+-                    self._outcome.errors.clear()
+-                    self._outcome.success = True
++                    for values, length in pending:
++                        del values[length:]
++                    if outcome is not None:
++                        outcome.success = previous_success
++                    if previous_stop is not None:
++                        result.shouldStop = previous_stop
+                     n -= 1
+                 if delay is not None:
+                     time.sleep(delay)

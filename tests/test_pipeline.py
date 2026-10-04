@@ -41,6 +41,8 @@ class FakeRunner(p.Runner):
         self.calls = []
         self.fail = None
         self.test_failure = False
+        self.test_name = 'test_one'
+        self.packages = ['fixture_pkg']
         self.infrastructure_failure = False
         self.missing_results = False
         self.package_version = '1'
@@ -70,23 +72,24 @@ class FakeRunner(p.Runner):
             install = Path(args[args.index('--install-base') + 1])
             (install / 'local_setup.bash').write_text('# fixture\n')
         elif args[:2] == ['colcon', 'list']:
-            text = 'fixture_pkg\n'
+            text = '\n'.join(self.packages) + '\n'
         elif args[0] == 'colcon' and 'test' in args:
+            package = args[args.index('--packages-select') + 1]
             base = Path(args[args.index('--test-result-base') + 1])
             log = Path(args[args.index('--log-base') + 1]) / 'latest_test'
             log.mkdir(parents=True)
             rc = 2 if self.infrastructure_failure else 0
-            events = "[0] (fixture_pkg) JobEnded: {'identifier': 'fixture_pkg', 'rc': %s}\n" % rc
+            events = f"[0] ({package}) JobEnded: {{'identifier': '{package}', 'rc': {rc}}}\n"
             if self.test_failure:
-                events += "[0] (fixture_pkg) TestFailure: {'identifier': 'fixture_pkg'}\n"
+                events += f"[0] ({package}) TestFailure: {{'identifier': '{package}'}}\n"
             (log / 'events.log').write_text(events)
             code = 1 if self.test_failure else rc
             if not self.missing_results:
-                (base / 'fixture_pkg').mkdir(parents=True)
+                (base / package).mkdir(parents=True)
                 fail = '<failure message="known failure"/>' if self.test_failure else ''
-                (base / 'fixture_pkg/test.xml').write_text(
+                (base / package / 'test.xml').write_text(
                     f'<testsuite tests="1" failures="{int(self.test_failure)}">'
-                    f'<testcase classname="fixture" name="test_one">{fail}</testcase></testsuite>')
+                    f'<testcase classname="fixture" name="{self.test_name}">{fail}</testcase></testsuite>')
         elif args[:2] == ['colcon', 'test-result']:
             code = int(self.test_failure)
         elif args[:3] == ['ros2', 'pkg', 'list']:
@@ -103,10 +106,14 @@ class FixturePipeline(p.Pipeline):
     def capabilities(self):
         pass
 
-    def smoke_checks(self, candidate):
-        return [{'rmw': rmw, 'talker': talker, 'passed': True}
-                for rmw in ['rmw_fastrtps_cpp', 'rmw_cyclonedds_cpp']
-                for talker in ['demo_nodes_cpp', 'demo_nodes_py']]
+    def smoke_checks(self, candidate, check_network=False):
+        results = []
+        for rmw in ['rmw_fastrtps_cpp', 'rmw_cyclonedds_cpp']:
+            for talker, listener in [('demo_nodes_cpp', 'demo_nodes_py'), ('demo_nodes_py', 'demo_nodes_cpp')]:
+                results.append(dict(rmw=rmw, kind='pubsub', localhost='1', talker=talker, listener=listener, passed=True))
+            for kind in ['service', 'action']:
+                results.append(dict(rmw=rmw, kind=kind, localhost='1', passed=True))
+        return results
 
 
 class LifecycleTests(unittest.TestCase):
@@ -122,6 +129,10 @@ class LifecycleTests(unittest.TestCase):
         self.args = p.parser().parse_args(['prepare', '--root', str(self.base / 'runtime'),
                                          '--source', 'manifest', '--manifest', str(self.manifest)])
         self.args.test_timeout = 7200
+        profile = p.read_json(p.REPO / 'config/bookworm.json')
+        profile['patches'] = []
+        self.args.profile = self.base / 'bookworm.json'
+        p.atomic_json(self.args.profile, profile)
         self.runner = FakeRunner(self.home)
         self.pipe = FixturePipeline(self.args, self.runner)
         self.quiet = contextlib.redirect_stdout(io.StringIO())
@@ -153,7 +164,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn('Ready: True', out.getvalue())
         state = p.read_json(candidate / 'metadata/state.json')
         self.assertTrue(all(x['status'] == 'passed' for x in state['stages'].values()))
-        self.assertEqual(len(p.read_json(candidate / 'metadata/smoke.json')), 4)
+        self.assertEqual(len(p.read_json(candidate / 'metadata/smoke.json')), 8)
         self.assertFalse(any('pull' in args for args, _, _ in self.runner.calls))
         self.assertTrue(any('--no-remove' in args for args, _, _ in self.runner.calls))
 
@@ -268,6 +279,7 @@ class LifecycleTests(unittest.TestCase):
         profile = self.base / 'empty.json'
         doc = p.read_json(p.REPO / 'config/bookworm.json')
         doc['skip_keys'] = {}
+        doc['patches'] = []
         p.atomic_json(profile, doc)
         self.args.profile = profile
         self.prepared()
@@ -437,7 +449,7 @@ class LifecycleTests(unittest.TestCase):
         def hybrid(args, **kwargs):
             tokens = [str(x) for x in args]
             inner = tokens[7:] if tokens[0] == '/bin/bash' else tokens
-            if inner[0] == 'colcon':
+            if inner[0] in ['colcon', 'ctest']:
                 real_runner.log = self.runner.log
                 return real_runner.run(args, **kwargs)
             return original(args, **kwargs)
@@ -465,7 +477,7 @@ class LifecycleTests(unittest.TestCase):
         def hybrid(args, **kwargs):
             tokens = [str(x) for x in args]
             inner = tokens[7:] if tokens[0] == '/bin/bash' else tokens
-            if inner[0] == 'colcon':
+            if inner[0] in ['colcon', 'ctest']:
                 real_runner.log = self.runner.log
                 return real_runner.run(args, **kwargs)
             return original(args, **kwargs)
@@ -522,8 +534,7 @@ class ParserAndReportTests(unittest.TestCase):
         (base / 'Test.xml').write_text('<Site><Testing><Test Status="passed"><Name>example</Name></Test></Testing></Site>')
         self.assertEqual(p.summarize_tests(base.parent, exceptions, exact)['testcases'], 1)
         (base / 'Test.xml').write_text('<Site><Testing><Test Status="notrun"><Name>example</Name></Test></Testing></Site>')
-        with self.assertRaises(p.PipelineError):
-            p.summarize_tests(base.parent, exceptions, exact)
+        self.assertTrue(p.summarize_tests(base.parent, exceptions, exact)['infrastructure'])
 
     def test_missing_pytest_report_cannot_be_waived(self):
         base, exceptions, exact = self.report_setup()
@@ -531,8 +542,9 @@ class ParserAndReportTests(unittest.TestCase):
         p.atomic_json(exceptions, {'schema_version': 1, 'exceptions': [{
             'package': 'fixture_pkg', 'classname': 'fixture', 'name': 'pytest.missing_result',
             'revision': 'a' * 40, 'reason': 'must not work'}]})
-        with self.assertRaisesRegex(p.PipelineError, 'cannot be waived'):
-            p.summarize_tests(base.parent, exceptions, exact)
+        report = p.summarize_tests(base.parent, exceptions, exact)
+        self.assertIn('cannot be waived', report['infrastructure'][0]['message'])
+        self.assertEqual(report['waived'], [])
 
     def test_timeout_report_cannot_be_waived(self):
         base, exceptions, exact = self.report_setup()
@@ -540,8 +552,9 @@ class ParserAndReportTests(unittest.TestCase):
         p.atomic_json(exceptions, {'schema_version': 1, 'exceptions': [{
             'package': 'fixture_pkg', 'classname': 'fixture', 'name': 'test_timeout',
             'revision': 'a' * 40, 'reason': 'must not work'}]})
-        with self.assertRaisesRegex(p.PipelineError, 'timeout cannot be waived'):
-            p.summarize_tests(base.parent, exceptions, exact)
+        report = p.summarize_tests(base.parent, exceptions, exact)
+        self.assertIn('timeout cannot be waived', report['infrastructure'][0]['message'])
+        self.assertEqual(report['waived'], [])
 
     def test_readme_commands_match_cli_and_shell_syntax(self):
         import re
@@ -652,10 +665,18 @@ class ParserAndReportTests(unittest.TestCase):
     def test_both_middleware_directions_are_checked(self):
         args = p.parser().parse_args(['status', '--root', str(self.base / 'runtime')])
         pipe = p.Pipeline(args, p.Runner(self.base))
+        pipe.root_setup()
+        (self.base / 'logs').mkdir()
         with patch.object(p, 'smoke_pair', return_value={'passed': True}) as smoke:
-            self.assertEqual(len(pipe.smoke_checks(self.base)), 4)
-            self.assertEqual({call.args[4]['RMW_IMPLEMENTATION'] for call in smoke.call_args_list},
-                             {'rmw_fastrtps_cpp', 'rmw_cyclonedds_cpp'})
+            with patch.object(p, 'smoke_exchange', return_value={'passed': True}) as exchange:
+                with patch.object(pipe, 'sourced_run', return_value=subprocess.CompletedProcess([], 0, '\n'.join(p.REQUIRED_ROS))):
+                    results = pipe.smoke_checks(self.base)
+        self.assertEqual(len(results), 8)
+        self.assertEqual(smoke.call_count, 4)
+        self.assertEqual(exchange.call_count, 4)
+        self.assertEqual({call.args[4]['RMW_IMPLEMENTATION'] for call in smoke.call_args_list},
+                         {'rmw_fastrtps_cpp', 'rmw_cyclonedds_cpp'})
+        self.assertTrue(all(call.kwargs['discovery'] for call in smoke.call_args_list))
 
     def test_wrapper_environment_and_legacy_variable(self):
         script = p.REPO / 'scripts/ros2_humble.sh'

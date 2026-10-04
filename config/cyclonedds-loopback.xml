@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Validation only: never installed as a host-wide DDS configuration. -->
+<CycloneDDS>
+  <Domain>
+    <General>
+      <Interfaces><NetworkInterface address="127.0.0.1" multicast="true"/></Interfaces>
+      <AllowMulticast>true</AllowMulticast>
+    </General>
+  </Domain>
+</CycloneDDS>

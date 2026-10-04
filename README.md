@@ -58,8 +58,9 @@ CANDIDATE="$HOME/ros2_humble_candidates/candidates/REPLACE_WITH_CANDIDATE_ID"
 ./scripts/ros2_humble.sh activate --candidate "$CANDIDATE"
 ```
 
-Open a **fresh terminal** and run the printed `source …/install/local_setup.bash`
-command. Activation writes no shell configuration or current-installation
+Open a **fresh terminal** and run the printed sourcing command and
+`export ROS_LOCALHOST_ONLY=1`. Certification covers local use; LAN communication
+is unverified. Activation writes no shell configuration or current-installation
 symlink. Switching workspace in an already sourced shell can leave old paths.
 
 ## Six stages
@@ -71,10 +72,11 @@ symlink. Switching workspace in an already sourced shell can leave old paths.
 | `prepare --source baseline\|upstream\|manifest` | Import into a fresh workspace and freeze exact source revisions |
 | `deps --candidate PATH` | Refresh rosdep, show the dependency plan, and install Debian packages |
 | `build --candidate PATH` | Check inputs/dependencies and build that candidate |
-| `validate --candidate PATH` | Full package tests plus communication checks on both DDS implementations |
+| `validate --candidate PATH` | Sequential package tests and local pub/sub, discovery, service, and action checks on both DDS implementations |
 | `activate --candidate PATH` | Check current readiness and print manual sourcing/rollback commands |
 | `run --source …` | All preparation/build/validation stages, without activation |
-| `status [--candidate PATH]` | Inventory or detailed stage/readiness report |
+| `status [--candidate PATH]` | Inventory or stage/readiness report, certification scope, and warnings |
+| `diagnose --candidate PATH [--check-network]` | Summarize saved failures and run bounded communication checks; never grant readiness |
 
 ### Capture the baseline
 
@@ -152,8 +154,9 @@ import. No later stage pulls sources.
 New upstream/custom candidates default to Release, tests enabled, system Python,
 isolated package installations, and `--symlink-install`. Baseline candidates reuse
 evidenced per-package build types/CMake arguments and package exclusions, with system Python
-and testing explicitly enforced. The default is two package workers and two
-compiler jobs per package. Set concurrency **when preparing**:
+and testing explicitly enforced. Builds default to two package workers and two
+compiler jobs per package. Validation runs one package and one CTest job at a time
+to prevent test interference. Set concurrency **when preparing**:
 
 ```bash
 ./scripts/ros2_humble.sh run --source upstream --workers 2 --jobs 2
@@ -175,35 +178,69 @@ and build tree: a symlink installation is not a standalone relocatable artifact.
 
 ### Validate
 
-Validation requires successful colcon test tasks, fresh CTest/JUnit reports,
-nonzero executed tests, and `colcon test-result --verbose`. It rejects missing
-reports, aborted jobs, infrastructure errors, and unapproved failures. Detailed
-ament reports written below `build/` are copied into the fresh result collection.
-See [colcon test options](https://colcon.readthedocs.io/en/released/reference/verb/test.html).
+Validation certifies **local ROS use**. It requires fresh CTest/JUnit reports,
+nonzero executed coverage, successful package test tasks, and
+`colcon test-result --verbose`. Missing/malformed reports, unexpected unexecuted
+tests, aborted jobs, infrastructure errors, crashes, and runtime failures block
+activation. Explicit benchmark skips and configured disabled tests are reported
+as such; they do not count as executed coverage.
 
-It also requires ROS CLI, demos, both RMW implementations, RViz, and rqt packages.
-Communication checks exercise C++ → Python and Python → C++ with both
-`rmw_fastrtps_cpp` and `rmw_cyclonedds_cpp`, using isolated topics/domains,
-localhost discovery, no ROS daemon, and a 30-second limit per check.
-Only processes started by the validator are terminated.
-
-The full test stage defaults to two hours:
+All tests run, including lint/style/type checks. Recognized lint failures default
+to warnings, identified by exact test names or configured CTest labels. Runtime
+tests in lint packages remain blocking. Choose strict lint gating explicitly:
 
 ```bash
-./scripts/ros2_humble.sh validate --candidate "$CANDIDATE" --test-timeout 7200
+./scripts/ros2_humble.sh validate --candidate "$CANDIDATE" --lint-policy strict
 ```
 
-Logs, test summaries, raw results, and exceptions used are retained. After sourcing
-an activated candidate, optionally check `ros2 run rviz2 rviz2`, `ros2 run rqt_gui rqt_gui`,
-and your hardware/application workflows on the MX desktop. These manual checks
-are not automatic activation gates.
+The checked-in `config/validation.json` defines classification and local scope.
+It identifies one known default-interface `ros2multicast` assertion as network-only,
+matching its exact test, source revision, and failure prefix. That failure is
+reported as a warning for local certification. Other failures in that package,
+changed revisions, missing results, and infrastructure errors remain blocking.
+LAN multicast/discovery is not certified by passing localhost checks.
+
+Package tests use separate reserved ROS domains, private ROS logs/cache paths,
+and `ROS_LOCALHOST_ONLY=1`. Native Cyclone tests use the recorded
+`config/cyclonedds-loopback.xml`, since native DDS tests bypass ROS settings.
+The profile explicitly selects loopback and enables its multicast support without
+changing host interface flags or firewall rules. Validation runs under a shared
+runtime-root lock. Native Cyclone tests with hard-coded domain-0 ports require
+those ports to be unused; stop your own domain-0 nodes before retrying if warned.
+
+Required packages include ROS CLI, demos, both DDS implementations, RViz, rqt,
+and action tutorials. Smoke checks require C++ → Python and Python → C++ pub/sub,
+daemon-free discovery, a correct service response, and an action result under
+both `rmw_fastrtps_cpp` and `rmw_cyclonedds_cpp`. Each check has a 30-second limit.
+Only owned processes and detached daemon descendants carrying the validation
+attempt token are terminated.
+
+The full package test stage defaults to two hours, separate from smoke checks:
+
+```bash
+./scripts/ros2_humble.sh validate --candidate "$CANDIDATE" \
+  --lint-policy warn --test-timeout 7200
+```
+
+Each attempt retains policy/configuration/exception snapshots, CTest inventory,
+colcon events, raw results, tests.json, and smoke.json below `logs/validation-<id>/`.
+The latest summaries also appear in `metadata/tests.json` and `metadata/smoke.json`,
+even on test failure. Smoke checks still run when package tests fail. Readiness
+requires all blocking outcomes to pass; diagnostic checks cannot replace validation.
+See [colcon test options](https://colcon.readthedocs.io/en/released/reference/verb/test.html).
+
+After activation, optionally check `ros2 run rviz2 rviz2`,
+`ros2 run rqt_gui rqt_gui`, and your hardware/application workflows on the MX
+desktop. These manual checks are not automatic activation gates.
 
 ### Activate and roll back
 
 Activation is allowed only after validation passes and the recorded source,
 configuration, and installed-package fingerprints still match. Package checking
 is conservative: **any installed Debian package version change** requests a rebuild
-and revalidation. There is no force-activation option.
+and revalidation. Validation code, policy, exceptions, or network configuration
+changes require revalidation without a ROS rebuild. Activation reports the local
+certification scope and warnings. There is no force-activation option.
 
 Roll back workspace selection in a fresh terminal:
 
@@ -232,12 +269,18 @@ a new one, or select a separate profile with `--profile PATH`.
 
 Do not add skip keys merely to hide resolution failures. Supply justified Debian
 mappings or exclude a genuinely optional package instead. Treat compatibility
-patches as versioned inputs.
+patches as versioned inputs. The default profile patches Humble launch-testing
+retry handling for Python 3.11 while preserving earlier test failures. It is based
+on the [upstream guarded implementation](https://github.com/ros2/launch/blob/rolling/launch_testing/launch_testing/markers.py).
+Patches apply only during fresh candidate preparation; an already matching
+postimage is recorded, while unknown drift stops preparation.
 
 `config/test-exceptions.json` starts empty. A reviewed exception needs `package`,
 `classname`, `name`, the exact repository `revision` (40-character commit SHA),
 and `reason`. Use the identifiers in `metadata/tests.json`; CTest-only test names
-use classname `CTest`. Choose the file with `--exceptions PATH` during preparation.
+use classname `CTest`. Choose the file with `--exceptions PATH` during preparation
+or validation. Validation stores a per-attempt snapshot; changing exceptions
+invalidates readiness without changing build inputs.
 Exceptions apply only to exact reported failures. Missing results, timeouts,
 infrastructure errors, and communication checks cannot be waived. Changed source
 revisions need new review; never use a package-wide waiver.
@@ -251,8 +294,49 @@ revisions need new review; never use a package-wide waiver.
 Inspect the stage log named in the report and `logs/`. Interrupted/failed stages
 never establish readiness. Retry `deps`, `build`, or `validate` explicitly after
 resolving the cause. Build retries require unchanged source/configuration inputs;
-new source, profile, patch, or exception inputs require a fresh candidate.
+new source, build profile, or patch inputs require a fresh candidate. Validation
+policy/exception/code changes require only another validation run.
 If system packages changed after build, rebuild before validating again.
+
+Inspect saved failures and run quick checks without rebuilding or running the full
+suite:
+
+```bash
+./scripts/ros2_humble.sh diagnose --candidate "$CANDIDATE"
+./scripts/ros2_humble.sh diagnose --candidate "$CANDIDATE" --check-network
+```
+
+`--check-network` also probes default-interface communication; it is a diagnostic,
+not proof of communication between two machines. Reports go to `logs/diagnose-<id>/`
+and do not change readiness. Known old metadata is migrated only after verifying
+its complete original fingerprint; old validation becomes stale. Unknown or
+changed provenance requires a fresh candidate, without an adoption bypass.
+
+Validator-only fixes allow reuse of an unchanged built candidate:
+
+```bash
+./scripts/ros2_humble.sh validate --candidate "$CANDIDATE" --lint-policy warn
+./scripts/ros2_humble.sh activate --candidate "$CANDIDATE"
+```
+
+To include the Python 3.11 source patch, create a **new** candidate from the existing
+candidate's pinned manifest. This retains the selected revisions and applies the
+current compatibility profile. These commands build and test ROS when you run them:
+
+```bash
+ROOT="$HOME/ros2_humble_updated"
+OLD="$ROOT/candidates/REPLACE_WITH_EXISTING_CANDIDATE_ID"
+./scripts/ros2_humble.sh prepare --root "$ROOT" --source manifest \
+  --manifest "$OLD/metadata/exact.repos"
+NEW="$ROOT/candidates/REPLACE_WITH_NEW_CANDIDATE_ID"
+./scripts/ros2_humble.sh deps --root "$ROOT" --candidate "$NEW"
+./scripts/ros2_humble.sh build --root "$ROOT" --candidate "$NEW"
+./scripts/ros2_humble.sh validate --root "$ROOT" --candidate "$NEW" --lint-policy warn
+./scripts/ros2_humble.sh activate --root "$ROOT" --candidate "$NEW"
+```
+
+Always supply the same `--root` when using a nondefault runtime directory.
+The previous candidate and `~/ros2_humble` remain at their existing paths.
 
 A failed dependency install still records the after-package snapshot. A failed
 prepare retains its diagnostic workspace; start a new prepare rather than importing
@@ -282,4 +366,6 @@ shellcheck scripts/*.sh
 ```
 
 Install ShellCheck separately if it is unavailable; it is a development tool, not
-a ROS runtime dependency. Python tests require Debian's `python3-yaml`.
+a ROS runtime dependency. Python tests require Debian's `python3-yaml`, `python3-pytest`, colcon, and CMake.
+They also build tiny non-ROS CMake fixtures in temporary directories to exercise
+actual colcon commands and CTest reporting. No apt commands or ROS builds run.

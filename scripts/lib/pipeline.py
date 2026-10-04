@@ -2,6 +2,7 @@
 """Local candidate lifecycle. No operation mutates a captured source workspace."""
 import argparse
 import ast
+import ctypes
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
@@ -33,7 +34,12 @@ BOOTSTRAP_PACKAGES = [
     'python3-colcon-parallel-executor', 'python3-colcon-test-result', 'python3-colcon-metadata',
 ]
 REQUIRED_ROS = ['ros2cli', 'demo_nodes_cpp', 'demo_nodes_py',
-                'rmw_fastrtps_cpp', 'rmw_cyclonedds_cpp', 'rviz2', 'rqt_gui']
+                'rmw_fastrtps_cpp', 'rmw_cyclonedds_cpp', 'rviz2', 'rqt_gui',
+                'action_tutorials_cpp', 'action_tutorials_py']
+# The last schema-1 implementation. Migration recomputes its complete input
+# fingerprint, including this original code hash; it never adopts unknown inputs.
+LEGACY_PIPELINES = ['f95426cbba05212767efc00e5ef169c2b7e850071874404d15b023125568910d']
+VALIDATION_PROFILE = REPO / 'config/validation.json'
 
 
 class PipelineError(RuntimeError):
@@ -168,6 +174,51 @@ class Runner:
                 os.killpg(proc.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+def local_ports(protocol):
+    """Read Linux socket tables without opening sockets or changing networking."""
+    ports = set()
+    for suffix in ['', '6']:
+        for line in Path(f'/proc/net/{protocol}{suffix}').read_text().splitlines()[1:]:
+            ports.add(int(line.split()[1].rsplit(':', 1)[1], 16))
+    return ports
+
+
+@contextmanager
+def subreaper():
+    # Detached ROS CLI daemons otherwise escape their command's process group.
+    # Adopt only descendants of this pipeline, then identify them by attempt token.
+    libc = ctypes.CDLL(None, use_errno=True)
+    previous = ctypes.c_int()
+    if libc.prctl(37, ctypes.byref(previous), 0, 0, 0) or libc.prctl(36, 1, 0, 0, 0):
+        raise PipelineError('Cannot enable owned-process cleanup on this Linux system.')
+    try:
+        yield
+    finally:
+        libc.prctl(36, previous.value, 0, 0, 0)
+
+
+def cleanup_owned_orphans(token):
+    path = Path(f'/proc/self/task/{os.getpid()}/children')
+    for value in path.read_text().split():
+        pid = int(value)
+        try:
+            env = Path(f'/proc/{pid}/environ').read_bytes().split(b'\0')
+            if ('ROS2_CANDIDATE_VALIDATION_TOKEN=' + token).encode() not in env:
+                continue
+            os.kill(pid, signal.SIGTERM)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                result, _ = os.waitpid(pid, os.WNOHANG)
+                if result:
+                    break
+                time.sleep(.05)
+            else:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+        except (FileNotFoundError, ProcessLookupError, ChildProcessError):
+            pass
 
 
 def git(path, *args):
@@ -516,7 +567,7 @@ class Pipeline:
             raise PipelineError('This profile supports MX 23.x only.')
 
     def capabilities(self):
-        for command in ['git', 'curl', 'vcs', 'rosdep', 'colcon', 'cmake', 'gcc']:
+        for command in ['git', 'curl', 'vcs', 'rosdep', 'colcon', 'cmake', 'ctest', 'gcc']:
             if not shutil.which(command, path=self.runner.env['PATH']):
                 raise PipelineError(f'Missing {command}; run bootstrap.')
         manifest_load(REPO / 'manifests/humble-bookworm-known-good.repos')
@@ -575,7 +626,8 @@ class Pipeline:
             p.mkdir()
             for name in ['src', 'build', 'install', 'logs', 'metadata']:
                 (p / name).mkdir()
-            state = {'schema_version': 1, 'path': str(p), 'created': now(), 'stages': {},
+            state = {'schema_version': 2, 'path': str(p), 'created': now(), 'stages': {},
+                     'preparation_pipeline_sha256': file_hash(__file__),
                      'source': self.args.source, 'baseline': str(baseline[0]) if baseline else None}
             with self.stage(p, state, 'prepare'):
                 selected = p / 'metadata/selected.repos'
@@ -615,8 +667,15 @@ class Pipeline:
                     dest = p / 'metadata' / f'patch-{i}.diff'
                     shutil.copyfile(patch['path'], dest)
                     repo_path = p / 'src' / patch['repository']
-                    self.runner.run(['git', '-C', repo_path, 'apply', '--check', dest])
-                    self.runner.run(['git', '-C', repo_path, 'apply', dest])
+                    checked = self.runner.run(['git', '-C', repo_path, 'apply', '--check', dest], check=False)
+                    if checked.returncode:
+                        # A matching postimage is already patched; any other drift
+                        # must be reviewed rather than silently skipping the patch.
+                        self.runner.run(['git', '-C', repo_path, 'apply', '--reverse', '--check', dest])
+                        patch['status'] = 'already_present'
+                    else:
+                        self.runner.run(['git', '-C', repo_path, 'apply', dest])
+                        patch['status'] = 'applied'
                 state['assets'] = assets
                 config = dict(baseline[1]['config']) if self.args.source == 'baseline' else {
                     'build_type': 'Release', 'symlink_install': True, 'packages_ignore': [], 'cmake_args': []}
@@ -644,7 +703,7 @@ class Pipeline:
             print(f'Candidate: {p}')
             return p
 
-    def input_fingerprint(self, p, state):
+    def input_fingerprint(self, p, state, legacy_sha=None):
         exact = manifest_load(p / 'metadata/exact.repos')
         if file_hash(p / 'metadata/exact.repos') != state['exact_sha256']:
             raise PipelineError('Exact manifest changed; create a new candidate.')
@@ -661,15 +720,37 @@ class Pipeline:
                 f = p / 'src' / n / name
                 if f.is_file():
                     untracked_hashes[f'{n}/{name}'] = file_hash(f)
-        inputs = ['selected.repos', 'exact.repos', 'profile.json', 'test-exceptions.json',
+        inputs = ['selected.repos', 'exact.repos', 'profile.json',
                   'source-diff.json', 'package-build.meta']
+        if legacy_sha:
+            inputs.append('test-exceptions.json')
         inputs += [f'mapping-{i}.yaml' for i, _ in enumerate(state['assets']['mappings'])]
         inputs += [f'patch-{i}.diff' for i, _ in enumerate(state['assets']['patches'])]
         metadata = {name: file_hash(p / 'metadata' / name) for name in inputs}
-        return digest({'source': stable, 'untracked': untracked_hashes, 'metadata': metadata,
-                       'config': state['config'], 'pipeline_sha256': file_hash(__file__)})
+        value = {'source': stable, 'untracked': untracked_hashes, 'metadata': metadata,
+                 'config': state['config']}
+        if legacy_sha:
+            value['pipeline_sha256'] = legacy_sha
+        return digest(value)
 
     def unchanged(self, p, state):
+        if state.get('schema_version') == 1:
+            matched = next((sha for sha in LEGACY_PIPELINES
+                            if self.input_fingerprint(p, state, sha) == state.get('input_fingerprint')), None)
+            built = state['stages'].get('build', {}).get('status') == 'passed'
+            if not matched or (built and state.get('build_fingerprint') != state['input_fingerprint']):
+                raise PipelineError('Unknown or changed legacy provenance; prepare a fresh candidate from exact.repos.')
+            state['migration'] = {'from_schema': 1, 'pipeline_sha256': matched,
+                                  'old_fingerprint': state['input_fingerprint'], 'verified': now()}
+            state['schema_version'] = 2
+            state['input_fingerprint'] = self.input_fingerprint(p, state)
+            if state.get('build_fingerprint'):
+                state['build_fingerprint'] = state['input_fingerprint']
+            state.pop('validation', None)
+            state['stages'].pop('validate', None)
+            # The caller holds the candidate lock when migration is persisted.
+        if state.get('schema_version') != 2:
+            raise PipelineError('Unsupported candidate metadata schema.')
         if self.input_fingerprint(p, state) != state['input_fingerprint']:
             raise PipelineError('Candidate inputs changed; create a fresh candidate.')
 
@@ -782,75 +863,275 @@ class Pipeline:
                                 'set -e; source "$1"; shift; exec "$@"', 'candidate', setup, *command],
                                **kwargs)
 
+    @contextmanager
+    def domain(self, directory):
+        leases = self.root / 'domains'
+        if leases.is_symlink():
+            raise PipelineError('Unsafe domain reservation directory.')
+        leases.mkdir(exist_ok=True)
+        start = uuid.uuid4().int % 180
+        occupied = local_ports('tcp') | local_ports('udp')
+        for offset in range(180):
+            domain = 20 + (start + offset) % 180
+            base_port = 7400 + 250 * domain
+            if 11511 + domain in occupied or any(base_port <= port < base_port + 250 for port in occupied):
+                continue
+            lease = leases / f'{domain}.lock'
+            if lease.is_symlink():
+                raise PipelineError('Unsafe domain lease.')
+            with lease.open('a') as stream:
+                try:
+                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue
+                token = uuid.uuid4().hex
+                private = Path(directory) / ('domain-' + str(domain) + '-' + token[:8])
+                private.mkdir(parents=True)
+                env = dict(ROS_DOMAIN_ID=str(domain), ROS_LOCALHOST_ONLY='1',
+                           ROS_HOME=str(private / 'home'), ROS_LOG_DIR=str(private / 'logs'),
+                           ROS2_CANDIDATE_VALIDATION_TOKEN=token, PYTHONUNBUFFERED='1')
+                try:
+                    yield env
+                finally:
+                    cleanup_owned_orphans(token)
+                return
+        raise PipelineError('No unused local ROS domain available; no existing processes were stopped.')
+
+    def ctest_inventory(self, p, env):
+        inventory = {}
+        for path in sorted((p / 'build').glob('*/CTestTestfile.cmake')):
+            cache = path.parent / 'CMakeCache.txt'
+            build_type = re.search(r'^CMAKE_BUILD_TYPE:[^=\n]+=(.*)$',
+                                   cache.read_text() if cache.exists() else '', re.M)
+            command = ['ctest', '--show-only=json-v1']
+            if build_type and build_type[1]:
+                command += ['-C', build_type[1]]
+            result = self.runner.run(command, cwd=path.parent,
+                                     env=env, check=False, timeout=15)
+            if result.returncode:
+                raise PipelineError(f'Cannot inventory configured CTest tests: {path.parent}')
+            try:
+                tests = json.loads(result.stdout)['tests']
+                inventory[path.parent.name] = {}
+                for test in tests:
+                    properties = {x['name']: x['value'] for x in test.get('properties', [])}
+                    inventory[path.parent.name][test['name']] = {
+                        'disabled': properties.get('DISABLED') is True,
+                        'skip_regex': properties.get('SKIP_REGULAR_EXPRESSION', []),
+                        'labels': properties.get('LABELS', []), 'command': test.get('command', [])}
+            except (KeyError, TypeError, ValueError) as e:
+                raise PipelineError(f'Invalid CTest inventory: {path.parent}') from e
+        return inventory
+
+    def validation_settings(self, p):
+        profile_path = Path(getattr(self.args, 'validation_profile', VALIDATION_PROFILE)).resolve()
+        profile, config = validation_profile(profile_path)
+        exception_path = getattr(self.args, 'exceptions', None) or p / 'metadata/test-exceptions.json'
+        exception_path = Path(exception_path).resolve()
+        validate_exceptions(read_json(exception_path))
+        return profile, config, {'profile': str(profile_path), 'exceptions': str(exception_path),
+                                 'lint_policy': getattr(self.args, 'lint_policy', 'warn'), 'scope': 'local'}
+
+    def validation_fingerprint(self, p, state, settings):
+        _, config = validation_profile(settings['profile'])
+        return digest({'input_fingerprint': self.input_fingerprint(p, state),
+                       'pipeline_sha256': file_hash(__file__), 'settings': settings,
+                       'profile_sha256': file_hash(settings['profile']),
+                       'cyclone_sha256': file_hash(config),
+                       'exceptions_sha256': file_hash(settings['exceptions'])})
+
+    def test_packages(self, p, state, attempt, env, config):
+        listed = self.runner.run(['colcon', 'list', '--base-paths', p / 'src', '--names-only',
+                                 '--ignore-user-meta', '--packages-ignore',
+                                 *state['config']['packages_ignore']], cwd=p, env=env).stdout.splitlines()
+        test_base = attempt / 'results'
+        test_base.mkdir()
+        try:
+            inventory = self.ctest_inventory(p, env)
+            errors = []
+        except PipelineError as e:
+            inventory, errors = {}, [str(e)]
+        atomic_json(attempt / 'ctest-inventory.json', inventory)
+        deadline = time.monotonic() + self.args.test_timeout
+        started_ns = time.time_ns()
+        events = {'completed': {}, 'errors': errors, 'test_failures': []}
+        for package in listed:
+            if not re.fullmatch(r'[A-Za-z0-9_]+', package):
+                events['errors'].append('Invalid colcon package name.')
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                events['errors'].append('Full-test timeout; remaining packages were not executed.')
+                break
+            print(f'Testing package: {package} (sequential, localhost)', flush=True)
+            log_base = attempt / 'colcon' / package
+            args = self.colcon_args(p, state)
+            args[args.index('--parallel-workers') + 1] = '1'
+            with self.domain(attempt / 'runtime' / package) as domain_env:
+                package_env = dict(env, **domain_env, CTEST_PARALLEL_LEVEL='1', MAKEFLAGS='-j1',
+                                   CMAKE_BUILD_PARALLEL_LEVEL='1')
+                if package == 'cyclonedds':
+                    # These native tests bypass ROS and otherwise ignore ROS_LOCALHOST_ONLY.
+                    package_env['CYCLONEDDS_URI'] = str(config)
+                    if any(7400 <= port < 7650 for port in local_ports('udp')):
+                        events['errors'].append('Native Cyclone tests require unused DDS domain-0 ports; '
+                                                'stop your own domain-0 ROS nodes before retrying.')
+                        continue
+                result = self.sourced_run(p, ['colcon', '--log-base', log_base, 'test', *args,
+                                              '--packages-select', package, '--test-result-base', test_base,
+                                              '--return-code-on-test-failure'], cwd=p, env=package_env,
+                                          check=False, timeout=remaining)
+            try:
+                outcome = read_test_events(log_base, [package])
+                events['completed'].update(outcome['completed'])
+                events['errors'].extend(outcome['errors'])
+                events['test_failures'].extend(outcome['test_failures'])
+            except (PipelineError, OSError, ValueError) as e:
+                events['errors'].append(str(e))
+            if result.returncode == 124:
+                events['errors'].append(f'Full-test timeout while running {package}.')
+                break
+            if result.returncode not in (0, 1):
+                events['errors'].append(f'{package}: unexpected colcon exit {result.returncode}')
+        missing = sorted(set(listed) - set(events['completed']))
+        if missing:
+            events['errors'].append(f'Packages not completed: {missing}')
+        collect_fresh_junit(p / 'build', test_base, started_ns)
+        summary = self.runner.run(['colcon', 'test-result', '--test-result-base', test_base,
+                                   '--verbose'], check=False, env=env, show=True, timeout=60)
+        if summary.returncode not in (0, 1):
+            events['errors'].append(f'colcon test-result infrastructure exit {summary.returncode}')
+        atomic_json(attempt / 'events.json', events)
+        return test_base, inventory, events, summary.returncode
+
     def validate(self):
         p, state = self.candidate()
-        with self.lock(p / '.candidate.lock'):
+        with self.lock(p / '.candidate.lock'), self.lock(self.root / '.validation.lock'), subreaper():
             self.require(state, 'build')
             self.unchanged(p, state)
             if package_versions(self.runner) != state['build_dependencies']:
                 raise PipelineError('System packages changed since build; rerun build before validation.')
+            profile, config, settings = self.validation_settings(p)
             with self.stage(p, state, 'validate'):
                 self.dependency_check(p, state)
-                env = self.colcon_env(p, state)
-                listed = self.runner.run(['colcon', 'list', '--base-paths', p / 'src', '--names-only',
-                                          '--ignore-user-meta', '--packages-ignore',
-                                          *state['config']['packages_ignore']], cwd=p, env=env).stdout.splitlines()
-                test_base = p / 'logs' / f'test-results-{unique_id()}'
-                log_base = p / 'logs' / f'colcon-test-{unique_id()}'
-                started_ns = time.time_ns()
-                result = self.sourced_run(p, ['colcon', '--log-base', log_base, 'test',
-                                              *self.colcon_args(p, state), '--test-result-base', test_base,
-                                              '--return-code-on-test-failure'], cwd=p, env=env,
-                                          check=False, timeout=self.args.test_timeout)
-                collect_fresh_junit(p / 'build', test_base, started_ns)
-                summary = self.runner.run(['colcon', 'test-result', '--test-result-base', test_base,
-                                           '--verbose'], check=False, env=env, show=True)
-                reports = summarize_tests(test_base, p / 'metadata/test-exceptions.json',
-                                          p / 'metadata/exact.repos')
-                atomic_json(p / 'metadata/tests.json', reports)
-                # colcon task return values distinguish infrastructure errors from test
-                # failures: completed packages must all have an ordinary successful task.
-                events = read_test_events(log_base, listed)
-                if result.returncode == 124 or events['errors']:
-                    raise PipelineError(f'Test timeout/infrastructure failure: {events}')
-                if result.returncode not in (0, 1) or summary.returncode not in (0, 1):
-                    raise PipelineError('Unexpected colcon test/test-result error.')
-                if result.returncode and not reports['waived']:
-                    raise PipelineError('colcon test failed without matching test exceptions.')
-                if reports['failures']:
-                    raise PipelineError(f'Unwaived test failures: {reports["failures"]}')
-                if summary.returncode and not reports['waived']:
-                    raise PipelineError('colcon test-result reports errors.')
+                fingerprint = self.validation_fingerprint(p, state, settings)
+                attempt = p / 'logs' / f'validation-{unique_id()}'
+                attempt.mkdir()
+                atomic_json(attempt / 'profile.json', profile)
+                shutil.copyfile(config, attempt / 'cyclonedds.xml')
+                shutil.copyfile(settings['exceptions'], attempt / 'exceptions.json')
+                env = dict(self.colcon_env(p, state), ROS_LOCALHOST_ONLY='1',
+                           ROS_LOG_DIR=str(attempt / 'ros-logs'), ROS_HOME=str(attempt / 'ros-home'))
+                try:
+                    base, inventory, events, summary_code = self.test_packages(
+                        p, state, attempt, env, attempt / 'cyclonedds.xml')
+                except (PipelineError, OSError, ValueError) as e:
+                    base = attempt / 'results'
+                    base.mkdir(exist_ok=True)
+                    inventory, summary_code = {}, 0
+                    events = {'errors': [str(e)], 'completed': {}, 'test_failures': []}
+                    atomic_json(attempt / 'events.json', events)
+                reports = summarize_tests(base, attempt / 'exceptions.json', p / 'metadata/exact.repos',
+                                          settings['lint_policy'], profile, inventory)
+                reports['infrastructure'].extend({'message': x} for x in events['errors'])
                 if not set(events['test_failures']).issubset(set(reports['failure_packages'])):
-                    raise PipelineError('TestFailure events have missing failure reports.')
-                packages = self.sourced_run(p, ['ros2', 'pkg', 'list']).stdout.splitlines()
-                missing = sorted(set(REQUIRED_ROS) - set(packages))
-                if missing:
-                    raise PipelineError(f'Required installed ROS packages missing: {missing}')
+                    reports['infrastructure'].append({'message': 'TestFailure events have missing failure reports.'})
+                explained = reports['failures'] or reports['waived'] or reports['warnings'] or reports['infrastructure']
+                if summary_code and not explained:
+                    reports['infrastructure'].append({'message': 'colcon test-result reports unexplained errors.'})
+                atomic_json(attempt / 'tests.json', reports)
+                atomic_json(p / 'metadata/tests.json', reports)
                 smoke = self.smoke_checks(p)
+                atomic_json(attempt / 'smoke.json', smoke)
                 atomic_json(p / 'metadata/smoke.json', smoke)
                 self.unchanged(p, state)
                 deps = package_versions(self.runner)
                 if deps != state['build_dependencies']:
-                    raise PipelineError('System packages changed during validation.')
-                state['validation'] = {'finished': now(), 'input_fingerprint': state['input_fingerprint'],
-                                       'dependencies': deps, 'reports': str(test_base),
-                                       'test_timeout': self.args.test_timeout}
-            print(f'Validated candidate: {p}\nRun activate --candidate {shlex.quote(str(p))} for manual instructions.')
+                    reports['infrastructure'].append({'message': 'System packages changed during validation.'})
+                if fingerprint != self.validation_fingerprint(p, state, settings):
+                    reports['infrastructure'].append({'message': 'Validation configuration changed during execution.'})
+                atomic_json(attempt / 'tests.json', reports)
+                atomic_json(p / 'metadata/tests.json', reports)
+                print(json.dumps({k: len(reports[k]) if isinstance(reports[k], list) else reports[k]
+                                  for k in ['passed', 'failed', 'skipped', 'disabled', 'warnings', 'waived',
+                                            'failures', 'infrastructure']}, indent=2), flush=True)
+                blockers = [x['message'] for x in reports['infrastructure']]
+                blockers += [f"{x['package']}: {x['classname']} {x['name']}" for x in reports['failures']]
+                blockers += smoke_blockers(smoke)
+                if blockers:
+                    raise PipelineError(f'Validation blocked ({len(reports["infrastructure"])} infrastructure errors); inspect {attempt}/tests.json and smoke.json: ' +
+                                        '; '.join(blockers[:8]))
+                state['validation'] = {'finished': now(), 'scope': 'local', 'settings': settings,
+                                       'fingerprint': fingerprint, 'input_fingerprint': state['input_fingerprint'],
+                                       'dependencies': deps, 'reports': str(base), 'attempt': str(attempt),
+                                       'warnings': reports['warnings'], 'test_timeout': self.args.test_timeout}
+            print(f'Validated candidate for LOCAL use: {p} ({len(reports["warnings"])} warnings). '
+                  'LAN communication is not certified.')
 
-    def smoke_checks(self, p):
+    def smoke_checks(self, p, check_network=False):
         setup = p / 'install/local_setup.bash'
         results = []
-        for rmw in ['rmw_fastrtps_cpp', 'rmw_cyclonedds_cpp']:
-            for talker, listener in [('demo_nodes_cpp', 'demo_nodes_py'), ('demo_nodes_py', 'demo_nodes_cpp')]:
-                name = f'{rmw}-{talker}'
-                output = p / 'logs' / f'smoke-{name}-{unique_id()}.log'
-                topic = '/candidate_' + uuid.uuid4().hex
-                env = dict(self.runner.env, RMW_IMPLEMENTATION=rmw, ROS_DOMAIN_ID=str(20 + uuid.uuid4().int % 180),
-                           ROS_LOCALHOST_ONLY='1', PYTHONUNBUFFERED='1')
-                # ros2 run/pkg use package lookup, not NodeStrategy/daemon commands.
-                results.append(smoke_pair(setup, talker, listener, topic, env, output, timeout=30))
+        directory = p / 'logs' / f'smoke-{unique_id()}'
+        directory.mkdir()
+        for local in (['1', '0'] if check_network else ['1']):
+            for rmw in ['rmw_fastrtps_cpp', 'rmw_cyclonedds_cpp']:
+                checks = [('pubsub', 'demo_nodes_cpp', 'demo_nodes_py'),
+                          ('pubsub', 'demo_nodes_py', 'demo_nodes_cpp'),
+                          ('service', 'demo_nodes_cpp', 'demo_nodes_py'),
+                          ('action', 'action_tutorials_cpp', 'action_tutorials_py')]
+                for index, (kind, server, client) in enumerate(checks):
+                    output = directory / f'{local}-{rmw}-{index}.log'
+                    entry = {'rmw': rmw, 'kind': kind, 'localhost': local, 'log': str(output)}
+                    try:
+                        with self.domain(directory / f'{local}-{rmw}-{index}') as domain_env:
+                            env = dict(self.runner.env, **domain_env, RMW_IMPLEMENTATION=rmw)
+                            env['ROS_LOCALHOST_ONLY'] = local
+                            if kind == 'pubsub':
+                                result = smoke_pair(setup, server, client, '/candidate_' + uuid.uuid4().hex,
+                                                    env, output, timeout=30, discovery=True)
+                            else:
+                                result = smoke_exchange(setup, kind, env, output, timeout=30)
+                            entry.update(result)
+                    except (PipelineError, OSError, ValueError) as e:
+                        entry.update(passed=False, error=str(e))
+                    results.append(entry)
+        try:
+            with self.domain(directory / 'package-check') as domain_env:
+                packages = self.sourced_run(p, ['ros2', 'pkg', 'list'], env=domain_env,
+                                            timeout=15).stdout.splitlines()
+                missing = sorted(set(REQUIRED_ROS) - set(packages))
+                if missing:
+                    results.append({'kind': 'packages', 'passed': False, 'error': f'Missing required ROS packages: {missing}'})
+        except (PipelineError, OSError) as e:
+            results.append({'kind': 'packages', 'passed': False, 'error': str(e)})
         return results
+
+    def diagnose(self):
+        p, state = self.candidate()
+        with self.lock(p / '.candidate.lock'), self.lock(self.root / '.validation.lock'), subreaper():
+            self.require(state, 'build')
+            self.unchanged(p, state)
+            profile, _, settings = self.validation_settings(p)
+            attempt = p / 'logs' / f'diagnose-{unique_id()}'
+            attempt.mkdir()
+            old_log, self.runner.log = self.runner.log, attempt / 'commands.log'
+            try:
+                bases = list((p / 'logs').glob('test-results-*')) + list((p / 'logs').glob('validation-*/results'))
+                bases = [x for x in bases if x.is_dir()]
+                if bases:
+                    base = max(bases, key=lambda x: x.stat().st_mtime_ns)
+                    inventory = self.ctest_inventory(p, self.colcon_env(p, state))
+                    reports = summarize_tests(base, settings['exceptions'], p / 'metadata/exact.repos',
+                                              settings['lint_policy'], profile, inventory)
+                else:
+                    reports = {'infrastructure': [{'message': 'No saved test results; run validate.'}]}
+                atomic_json(attempt / 'tests.json', reports)
+                smoke = self.smoke_checks(p, check_network=self.args.check_network)
+                atomic_json(attempt / 'smoke.json', smoke)
+                print(f'Diagnostic reports: {attempt}\nReadiness was not granted. Local checks: ' +
+                      str(not smoke_blockers([x for x in smoke if x.get('localhost', '1') == '1'])))
+            finally:
+                self.runner.log = old_log
 
     def activate(self):
         p, state = self.candidate()
@@ -864,7 +1145,10 @@ class Pipeline:
                 raise PipelineError('System packages changed; rebuild and revalidate before activation.')
             if not (p / 'install/local_setup.bash').is_file():
                 raise PipelineError('Candidate setup script is missing.')
-            print('Open a fresh terminal, then run:\n' + activation_command(p))
+            if validation.get('fingerprint') != self.validation_fingerprint(p, state, validation['settings']):
+                raise PipelineError('Validation code or policy changed; rerun validate (no ROS rebuild required).')
+            print(f"Certification: LOCAL use; {len(validation.get('warnings', []))} warnings. LAN unverified.")
+            print('Open a fresh terminal, then run:\n' + activation_command(p) + '\nexport ROS_LOCALHOST_ONLY=1')
             print('Workspace rollback in another fresh terminal:\n' +
                   'source ' + shlex.quote(str(self.legacy / 'install/local_setup.bash')))
             print('No shell settings were changed. Workspace rollback does not undo apt changes.')
@@ -875,7 +1159,12 @@ class Pipeline:
             print(json.dumps(state, indent=2, sort_keys=True))
             try:
                 self.unchanged(p, state)
-                current = state.get('validation', {}).get('dependencies') == package_versions(self.runner)
+                validation = state.get('validation', {})
+                current = (validation.get('dependencies') == package_versions(self.runner) and
+                           bool(validation.get('fingerprint')) and
+                           validation['fingerprint'] == self.validation_fingerprint(p, state, validation['settings']))
+                print('Certification:', validation.get('scope', 'unvalidated'))
+                print('Warnings:', len(validation.get('warnings', [])))
                 print('Ready:', bool(current and state['stages'].get('validate', {}).get('status') == 'passed'))
             except PipelineError as e:
                 print(f'Ready: False ({e})')
@@ -959,97 +1248,207 @@ def collect_fresh_junit(build, destination, started_ns):
         shutil.copyfile(path, target)
 
 
-def summarize_tests(base, exception_file, exact_file):
+def validation_profile(path=VALIDATION_PROFILE):
+    doc = read_json(path)
+    if (not isinstance(doc, dict) or set(doc) != {
+            'schema_version', 'scope', 'lint_tests', 'lint_labels',
+            'network_only_tests', 'cyclone_config'} or
+            doc['schema_version'] != 1 or doc['scope'] != 'local'):
+        raise PipelineError('Invalid local validation profile.')
+    for key in ['lint_tests', 'lint_labels']:
+        if not isinstance(doc[key], list) or not all(
+                isinstance(x, str) and re.fullmatch(r'[a-z][a-z0-9_]*', x) for x in doc[key]):
+            raise PipelineError(f'Invalid validation profile {key}.')
+    if not isinstance(doc['network_only_tests'], list):
+        raise PipelineError('network_only_tests must be a list.')
+    for test in doc['network_only_tests']:
+        if (not isinstance(test, dict) or set(test) != {
+                'package', 'classname', 'name', 'revision', 'message_prefix', 'reason'} or
+                not all(isinstance(x, str) and x.strip() for x in test.values()) or
+                not re.fullmatch(r'[0-9a-f]{40}', test['revision'])):
+            raise PipelineError('Network-only tests require exact identity, revision, failure prefix and reason.')
+    if not isinstance(doc['cyclone_config'], str) or not doc['cyclone_config']:
+        raise PipelineError('Cyclone configuration must be a profile-relative filename.')
+    config = Path(path).parent / doc['cyclone_config']
+    if not contained(config, Path(path).parent) or not config.is_file():
+        raise PipelineError('Unsafe or missing Cyclone validation configuration.')
+    return doc, config
+
+
+def summarize_tests(base, exception_file, exact_file, lint_policy='warn', profile=None,
+                    ctest_metadata=None):
+    """Collect every outcome. Malformed/missing reports are data, never waivers."""
     doc = read_json(exception_file)
     validate_exceptions(doc)
+    profile = profile or validation_profile()[0]
+    ctest_metadata = ctest_metadata or {}
     exact = manifest_load(exact_file)
-    # A package can reside inside any manifest repository; package mapping is
-    # supplied separately through the report's package and resolved below.
-    repo_by_package = {}
+    repo_by_package, python_reports = {}, set()
     candidate = Path(exact_file).parent.parent
+    report = dict(testcases=0, passed=0, failed=0, skipped=0, disabled=0, files=[],
+                  failures=[], warnings=[], waived=[], infrastructure=[], failure_packages=[])
     for name in exact:
-        for p in (candidate / 'src' / name).rglob('package.xml'):
+        for path in (candidate / 'src' / name).rglob('package.xml'):
             try:
-                pkg = ET.parse(p).getroot().findtext('name')
-                if pkg:
-                    repo_by_package[pkg] = name
-            except ET.ParseError as e:
-                raise PipelineError(f'Malformed package.xml: {p}') from e
-    failures, waived, count, files, ctests = [], [], 0, [], []
-    failure_packages = set()
-    per_file = {}
+                package = ET.parse(path).getroot().findtext('name')
+                if package:
+                    repo_by_package[package] = name
+                    if (path.parent / 'setup.py').exists() and any(
+                            list((path.parent / directory).rglob('test_*.py')) for directory in ['test', 'tests']):
+                        python_reports.add(package)
+            except ET.ParseError:
+                report['infrastructure'].append({'message': f'Malformed package.xml: {path}'})
+
+    def identity(package, classname, name, path):
+        repo = repo_by_package.get(package)
+        return dict(package=package, classname=classname, name=name,
+                    revision=exact[repo]['version'] if repo else '', file=str(path))
+
+    def fail(item, message, infrastructure=False, labels=()):
+        item = dict(item, message=message)
+        if item.get('package'):
+            report['failure_packages'].append(item['package'])
+        if infrastructure:
+            report['infrastructure'].append(item)
+            return
+        match = next((e for e in doc['exceptions'] if all(e[k] == item[k]
+                      for k in ['package', 'classname', 'name', 'revision'])), None)
+        if match:
+            report['waived'].append(dict(item, reason=match['reason']))
+        elif lint_policy == 'warn' and (item['name'] in profile['lint_tests'] or
+                                       set(labels).intersection(profile['lint_labels'])):
+            report['warnings'].append(dict(item, category='lint', reason='Lint policy: warn'))
+        else:
+            network = next((e for e in profile['network_only_tests'] if
+                            all(e[k] == item[k] for k in ['package', 'classname', 'name', 'revision']) and
+                            message.startswith(e['message_prefix'])), None)
+            if network:
+                report['warnings'].append(dict(item, category='network', reason=network['reason']))
+            else:
+                report['failures'].append(item)
+
+    wrappers, detailed = [], {}
     for path in sorted(Path(base).rglob('*.xml')):
+        package = path.relative_to(base).parts[0]
         try:
             root = ET.parse(path).getroot()
-        except ET.ParseError as e:
-            raise PipelineError(f'Malformed test result: {path}') from e
-        cases = list(root.iter('testcase'))
-        package = path.relative_to(base).parts[0]
+        except (OSError, ET.ParseError) as e:
+            fail(identity(package, '', '', path), f'Malformed test result: {e}', True)
+            continue
         if root.tag == 'Site':
+            report['files'].append(str(path))
             if root.find('Testing') is None:
-                raise PipelineError(f'Invalid CTest report: {path}')
-            files.append(str(path))
-            for case in root.findall('Testing/Test'):
-                status = case.get('Status')
-                if status not in ('passed', 'failed', 'notrun'):
-                    raise PipelineError(f'Invalid CTest status: {path}')
-                if status == 'notrun':
-                    raise PipelineError(f'CTest did not execute: {case.findtext("Name")}')
-                count += 1
-                if status == 'failed':
-                    failure_packages.add(package)
-                    completion = case.findtext('Results/NamedMeasurement[@name="Completion Status"]/Value', '')
-                    if completion not in ('Completed', 'Failed'):
-                        raise PipelineError(f'CTest infrastructure failure: {path}: {completion}')
-                    ctests.append((package, case.findtext('Name', ''), path))
+                fail(identity(package, 'CTest', '', path), 'Invalid CTest report', True)
+            wrappers.extend((package, case, path) for case in root.findall('Testing/Test'))
             continue
         if root.tag not in ('testsuite', 'testsuites'):
-            continue  # CTest metadata XML is not a JUnit report.
-        files.append(str(path))
-        count += sum(c.find('skipped') is None for c in cases)
-        declared_failures = sum(int(s.get('failures', '0')) + int(s.get('errors', '0'))
-                                for s in ([root] if root.tag == 'testsuite' else root.findall('testsuite')))
-        detailed_failures = sum(any(x.tag in ('failure', 'error') for x in c) for c in cases)
-        if declared_failures > detailed_failures:
-            raise PipelineError(f'Test suite failure has no identifiable testcase: {path}')
-        file_failures = []
-        for case in cases:
-            if not any(x.tag in ('failure', 'error') for x in case):
-                continue
-            repo = repo_by_package.get(package)
-            revision = exact[repo]['version'] if repo else ''
-            failure = {'package': package, 'classname': case.get('classname', ''),
-                       'name': case.get('name', ''), 'revision': revision, 'file': str(path)}
-            if 'missing_result' in failure['name'] or any(
-                    'without generating a result' in (x.get('message', '') + (x.text or ''))
-                    for x in case if x.tag in ('failure', 'error')):
-                raise PipelineError(f'Missing test result cannot be waived: {path}')
-            if any(re.search(r'(?i)\b(timeout|timed out)\b', x.get('message', '') + (x.text or ''))
-                   for x in case if x.tag in ('failure', 'error')):
-                raise PipelineError(f'Test timeout cannot be waived: {path}')
-            failure_packages.add(package)
-            match = next((e for e in doc['exceptions'] if all(e[k] == failure[k]
-                          for k in ['package', 'classname', 'name', 'revision'])), None)
-            (waived if match else failures).append(dict(failure, reason=match['reason']) if match else failure)
-            file_failures.append(bool(match))
-        per_file[(package, path.name)] = file_failures
-    for package, name, path in ctests:
-        # Ament's CTest wrapper fails when its detailed JUnit fails. Only waive
-        # that wrapper when every corresponding detailed failure was matched.
-        matches = [values for (pkg, filename), values in per_file.items()
-                   if pkg == package and (filename == name + '.xml' or filename.startswith(name + '.'))]
-        if matches and any(matches) and all(all(values) for values in matches):
             continue
-        repo = repo_by_package.get(package)
-        failure = {'package': package, 'classname': 'CTest', 'name': name,
-                   'revision': exact[repo]['version'] if repo else '', 'file': str(path)}
-        match = next((e for e in doc['exceptions'] if all(e[k] == failure[k]
-                      for k in ['package', 'classname', 'name', 'revision'])), None)
-        (waived if match else failures).append(dict(failure, reason=match['reason']) if match else failure)
-    if not files or count == 0:
-        raise PipelineError('No fresh executed testcases were produced.')
-    return {'testcases': count, 'files': files, 'failures': failures, 'waived': waived,
-            'failure_packages': sorted(failure_packages)}
+        report['files'].append(str(path))
+        cases = list(root.iter('testcase'))
+        suites = [root] if root.tag == 'testsuite' else root.findall('testsuite')
+        try:
+            counters = [int(suite.get(key, '0')) for suite in suites
+                        for key in ['tests', 'failures', 'errors', 'skipped']]
+            if any(value < 0 for value in counters):
+                raise ValueError('Negative test suite counter')
+            declared = sum(int(x.get('failures', '0')) + int(x.get('errors', '0')) for x in suites)
+            if declared > sum(any(x.tag in ('failure', 'error') for x in c) for c in cases):
+                fail(identity(package, '', '', path), 'Test suite failure has no identifiable testcase', True)
+        except ValueError:
+            fail(identity(package, '', '', path), 'Invalid test suite counters', True)
+        records = []
+        for case in cases:
+            item = identity(package, case.get('classname', ''), case.get('name', ''), path)
+            issues = [x for x in case if x.tag in ('failure', 'error')]
+            suppressed = case.get('status') == 'notrun' and case.get('result') == 'suppressed'
+            if case.get('status') == 'notrun' and not suppressed:
+                fail(item, 'JUnit testcase did not execute for an unknown reason', True)
+                continue
+            if case.find('skipped') is not None or case.get('result') == 'skipped' or suppressed:
+                if issues:
+                    fail(item, 'Test is simultaneously skipped and failed', True)
+                report['disabled' if suppressed else 'skipped'] += 1
+                continue
+            report['testcases'] += 1
+            if not issues:
+                report['passed'] += 1
+                continue
+            report['failed'] += 1
+            records.append(item)
+            message = '\n'.join(x.get('message', '') + '\n' + (x.text or '') for x in issues).strip()
+            missing = ('missing_result' in item['name'] or
+                       any(text in message for text in ['without generating a result',
+                                                       'The test did not generate a result file.']))
+            # Execution markers/types are authoritative. A traceback that merely
+            # quotes a timeout assertion is an ordinary reported test failure.
+            timeout = any(x.get('type', '').rsplit('.', 1)[-1] in
+                          ('TimeoutError', 'TimeoutExpired') or
+                          re.fullmatch(r'Timeout(?: \(>[^)]+\))?', x.get('message', ''))
+                          for x in issues)
+            timeout = timeout or bool(re.fullmatch(
+                r'AssertionError: (?:Waiting for output timed out|Timed out waiting for process .+)',
+                message.splitlines()[-1] if message else ''))
+            crash = any(x.get('message', '').startswith(('Segmentation fault', 'Process crashed',
+                                                        'Aborted (core dumped)')) for x in issues)
+            infra = missing or timeout or crash or any(x.tag == 'error' for x in issues)
+            if missing:
+                message = 'Missing test result cannot be waived: ' + message
+            elif timeout:
+                message = 'Test timeout cannot be waived: ' + message
+            labels = [label for metadata in ctest_metadata.get(package, {}).values()
+                      if path.name in ' '.join(metadata.get('command', []))
+                      for label in metadata.get('labels', [])]
+            fail(item, message, infra, labels)
+        detailed[(package, path.name)] = records
+
+    for package, case, path in wrappers:
+        name, status = case.findtext('Name', ''), case.get('Status')
+        item = identity(package, 'CTest', name, path)
+        completion = case.findtext('Results/NamedMeasurement[@name="Completion Status"]/Value', '')
+        properties = ctest_metadata.get(package, {}).get(name, {})
+        if status == 'notrun':
+            if re.fullmatch(r'SKIP_RETURN_CODE=-?\d+', completion):
+                report['skipped'] += 1
+            elif completion == 'Disabled' and properties.get('disabled') is True:
+                report['disabled'] += 1
+            elif completion == 'SKIP_REGULAR_EXPRESSION_MATCHED' and properties.get('skip_regex'):
+                report['skipped'] += 1
+            else:
+                fail(item, f'CTest did not execute: {name} ({completion or "unknown reason"})', True)
+            continue
+        if status not in ('passed', 'failed'):
+            fail(item, f'Invalid CTest status: {status}', True)
+            continue
+        # Match the actual detailed result named in the ament command first.
+        command = case.findtext('FullCommandLine', '') + ' ' + case.findtext(
+            'Results/NamedMeasurement[@name="Command Line"]/Value', '')
+        linked = [key for key in detailed if key[0] == package and
+                  (key[1] in command or key[1] == name + '.xml' or key[1].startswith(name + '.'))]
+        if not linked:
+            report['testcases'] += 1
+            report['passed' if status == 'passed' else 'failed'] += 1
+        if status == 'failed':
+            if completion not in ('Completed', 'Failed'):
+                fail(item, f'CTest infrastructure failure: {completion}', True)
+            elif not any(detailed[key] for key in linked):
+                fail(item, case.findtext('Results/Measurement/Value', '') or 'CTest failed',
+                     labels=properties.get('labels', []))
+        elif any(detailed[key] for key in linked):
+            fail(item, 'CTest passed but its detailed report failed', True)
+    for package in sorted(python_reports):
+        if not any(pkg == package for pkg, _ in detailed):
+            report['infrastructure'].append({'package': package,
+                                             'message': 'Missing fresh Python test report cannot be waived.'})
+    for package, configured in ctest_metadata.items():
+        observed = {case.findtext('Name', '') for pkg, case, _ in wrappers if pkg == package}
+        missing = sorted(set(configured) - observed)
+        if missing:
+            report['infrastructure'].append({'package': package,
+                                             'message': f'Configured CTest tests have no fresh outcome: {missing}'})
+    report['failure_packages'] = sorted(set(report['failure_packages']))
+    if not report['files'] or report['testcases'] == 0:
+        report['infrastructure'].append({'message': 'No fresh executed testcases were produced.'})
+    return report
 
 
 def read_test_events(log_base, packages):
@@ -1079,7 +1478,21 @@ def read_test_events(log_base, packages):
     return {'completed': completed, 'errors': errors, 'test_failures': test_failures}
 
 
-def smoke_pair(setup, talker, listener, topic, env, output, timeout=30, popen=subprocess.Popen):
+def smoke_blockers(results):
+    blockers = [x.get('error', 'Communication check failed') for x in results if not x['passed']]
+    for rmw in ['rmw_fastrtps_cpp', 'rmw_cyclonedds_cpp']:
+        local = [x for x in results if x.get('rmw') == rmw and x.get('localhost') == '1']
+        directions = {(x.get('talker'), x.get('listener')) for x in local if x.get('kind') == 'pubsub'}
+        if not {('demo_nodes_cpp', 'demo_nodes_py'), ('demo_nodes_py', 'demo_nodes_cpp')}.issubset(directions):
+            blockers.append(f'Missing mandatory pub/sub checks: {rmw}')
+        for kind in ['service', 'action']:
+            if not any(x.get('kind') == kind for x in local):
+                blockers.append(f'Missing mandatory {kind} check: {rmw}')
+    return blockers
+
+
+def smoke_pair(setup, talker, listener, topic, env, output, timeout=30, popen=subprocess.Popen,
+               discovery=False):
     processes = []
     start = time.monotonic()
     try:
@@ -1088,12 +1501,32 @@ def smoke_pair(setup, talker, listener, topic, env, output, timeout=30, popen=su
                 command = ['/bin/bash', '--noprofile', '--norc', '-c',
                            'set -e; source "$1"; shift; exec "$@"', 'smoke', str(setup),
                            'ros2', 'run', package, executable, '--ros-args', '-r', f'chatter:={topic}']
+                if discovery:
+                    command += ['-r', f'__node:=candidate_{executable}']
                 processes.append(popen(command, env=env, stdout=log, stderr=subprocess.STDOUT,
                                        start_new_session=True))
             while time.monotonic() - start < timeout:
                 log.flush()
                 text = Path(output).read_text(errors='replace')
                 if all(p.poll() is None for p in processes) and 'Publishing' in text and 'I heard' in text:
+                    if discovery:
+                        with tempfile.TemporaryFile(mode='w+') as graph_output:
+                            command = ['/bin/bash', '--noprofile', '--norc', '-c',
+                                       'set -e; source "$1"; shift; exec "$@"', 'smoke', str(setup),
+                                       'ros2', 'node', 'list', '--no-daemon', '--spin-time', '1']
+                            graph = popen(command, env=env, stdout=graph_output, stderr=subprocess.STDOUT,
+                                          start_new_session=True)
+                            processes.append(graph)
+                            try:
+                                code = graph.wait(timeout=max(.01, timeout - (time.monotonic() - start)))
+                            except subprocess.TimeoutExpired as e:
+                                raise PipelineError(f'Smoke discovery timeout: {output}') from e
+                            graph_output.seek(0)
+                            names = graph_output.read()
+                            log.write('\n[daemon-free discovery]\n' + names)
+                            log.flush()
+                            if code or not {'/candidate_talker', '/candidate_listener'}.issubset(names.splitlines()):
+                                raise PipelineError(f'Smoke discovery failed: {output}')
                     return {'rmw': env['RMW_IMPLEMENTATION'], 'talker': talker, 'listener': listener,
                             'passed': True, 'log': str(output), 'seconds': time.monotonic() - start}
                 if any(p.poll() is not None for p in processes):
@@ -1103,6 +1536,44 @@ def smoke_pair(setup, talker, listener, topic, env, output, timeout=30, popen=su
     finally:
         for proc in processes:
             Runner.stop(proc)
+
+
+def smoke_exchange(setup, kind, env, output, timeout=30, popen=subprocess.Popen):
+    service = kind == 'service'
+    package = 'demo_nodes' if service else 'action_tutorials'
+    executable = 'add_two_ints' if service else 'fibonacci_action'
+    resource = 'add_two_ints' if service else 'fibonacci'
+    remap = resource + ':=/candidate_' + uuid.uuid4().hex
+    processes = []
+    start = time.monotonic()
+    try:
+        with Path(output).open('w+') as log:
+            for language, role in [('cpp', 'server'), ('py', 'client')]:
+                args = ['/bin/bash', '--noprofile', '--norc', '-c',
+                        'set -e; source "$1"; shift; exec "$@"', 'smoke', str(setup),
+                        'ros2', 'run', package + '_' + language, executable + '_' + role,
+                        '--ros-args', '-r', remap]
+                processes.append(popen(args, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                       start_new_session=True))
+            server, client = processes
+            try:
+                code = client.wait(timeout=max(.01, timeout - (time.monotonic() - start)))
+            except subprocess.TimeoutExpired as e:
+                raise PipelineError(f'Smoke {kind} timeout ({timeout}s): {output}') from e
+            log.flush()
+            text = Path(output).read_text(errors='replace')
+            if service:
+                received = re.search(r'Result of add_two_ints: 5\b', text)
+            else:
+                match = re.search(r"Result: array\('i', \[([0-9, ]+)\]\)", text)
+                received = bool(match and [int(x) for x in match[1].split(',')] ==
+                                [0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55])
+            if code or server.poll() is not None or not received:
+                raise PipelineError(f'Smoke {kind} failed or returned an unexpected result: {output}')
+            return {'passed': True, 'seconds': time.monotonic() - start}
+    finally:
+        for process in processes:
+            Runner.stop(process)
 
 
 def activation_command(candidate):
@@ -1122,12 +1593,15 @@ def positive(value):
 def parser():
     p = argparse.ArgumentParser(description='Prepare and validate isolated ROS 2 Humble candidates; activation is manual.')
     sub = p.add_subparsers(dest='command', required=True)
-    for verb in ['baseline', 'bootstrap', 'prepare', 'deps', 'build', 'validate', 'activate', 'run', 'status']:
-        q = sub.add_parser(verb)
+    for verb in ['baseline', 'bootstrap', 'prepare', 'deps', 'build', 'validate', 'activate', 'run', 'status', 'diagnose']:
+        descriptions = {'validate': 'Run sequential full tests and mandatory local DDS checks.',
+                        'diagnose': 'Inspect saved results and run quick checks without granting readiness.',
+                        'activate': 'Verify current local certification and print commands for a fresh terminal.'}
+        q = sub.add_parser(verb, description=descriptions.get(verb), help=descriptions.get(verb))
         q.set_defaults(candidate=None, baseline=None, manifest=None)
         q.add_argument('--root', type=Path, default=Path.home() / 'ros2_humble_candidates',
                        help='Runtime root (default: ~/ros2_humble_candidates).')
-        if verb in ['deps', 'build', 'validate', 'activate', 'status']:
+        if verb in ['deps', 'build', 'validate', 'activate', 'status', 'diagnose']:
             q.add_argument('--candidate', type=Path, required=verb != 'status',
                            help='Existing candidate under ROOT/candidates.')
         if verb == 'baseline':
@@ -1142,6 +1616,14 @@ def parser():
             q.add_argument('--exceptions', type=Path, default=REPO / 'config/test-exceptions.json')
             q.add_argument('--workers', type=positive, default=2)
             q.add_argument('--jobs', type=positive, default=2)
+        if verb == 'diagnose':
+            q.add_argument('--check-network', action='store_true', help='Also diagnose default-interface DDS communication; never certify LAN use.')
+        if verb in ['validate', 'run', 'diagnose']:
+            q.add_argument('--lint-policy', choices=['warn', 'strict'], default='warn', help='Run lint tests; report failures as warnings by default.')
+            q.add_argument('--validation-profile', type=Path, default=VALIDATION_PROFILE,
+                           help='Local scope, exact lint/network classifications and Cyclone configuration.')
+        if verb == 'validate':
+            q.add_argument('--exceptions', type=Path, help='Reviewed exact test exceptions; default: candidate snapshot.')
         if verb in ['validate', 'run']:
             q.add_argument('--test-timeout', type=positive, default=7200, help='Full-test timeout in seconds.')
     return p
