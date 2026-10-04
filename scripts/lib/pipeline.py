@@ -30,7 +30,7 @@ BOOTSTRAP_PACKAGES = [
     'python3-pytest-cov', 'python3-flake8', 'python3-flake8-docstrings',
     'python3-rosdep2', 'vcstool', 'colcon', 'python3-colcon-ros',
     'python3-colcon-cmake', 'python3-colcon-python-setup-py',
-    'python3-colcon-parallel-executor', 'python3-colcon-test-result',
+    'python3-colcon-parallel-executor', 'python3-colcon-test-result', 'python3-colcon-metadata',
 ]
 REQUIRED_ROS = ['ros2cli', 'demo_nodes_cpp', 'demo_nodes_py',
                 'rmw_fastrtps_cpp', 'rmw_cyclonedds_cpp', 'rviz2', 'rqt_gui']
@@ -107,6 +107,16 @@ class Runner:
         effective = dict(self.env)
         if env:
             effective.update(env)
+        privileged = command[0] == 'sudo'
+        if privileged:
+            # Authenticate on the caller's terminal before redirecting logs.
+            # Keep sudo in this session: tty-scoped credentials cannot be used
+            # by a detached process without a controlling terminal.
+            auth = subprocess.run(['sudo', '-v'], env=effective)
+            if auth.returncode:
+                raise CommandError(['sudo', '-v'], auth.returncode,
+                                   'Authenticate from an interactive terminal, then retry.')
+            command = [command[0], '-n', *command[1:]]
         # Command output goes directly to the stage log while long builds run.
         with (open(self.log, 'a+') if self.log else tempfile.TemporaryFile(mode='w+')) as out:
             out.write(f'\n[{now()}] $ {shlex.join(command)}\n')
@@ -114,14 +124,14 @@ class Runner:
             start = out.tell()
             print(f'>>> {shlex.join(command)}', flush=True)
             proc = subprocess.Popen(command, cwd=cwd, env=effective, stdout=out,
-                                    stderr=subprocess.STDOUT, start_new_session=True)
+                                    stderr=subprocess.STDOUT, start_new_session=not privileged)
             try:
                 code = proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                self.stop(proc)
+                self.stop(proc, group=not privileged)
                 code = 124
             except BaseException:
-                self.stop(proc)
+                self.stop(proc, group=not privileged)
                 raise
             out.seek(start)
             output = out.read()
@@ -132,7 +142,18 @@ class Runner:
         return subprocess.CompletedProcess(command, code, output, '')
 
     @staticmethod
-    def stop(proc):
+    def stop(proc, group=True):
+        if not group:
+            # A terminal-attached sudo shares the caller's process group.
+            # Never signal that group (which contains the shell and pipeline).
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            return
         try:
             # Terminate the owned session even if its leader exited first.
             os.killpg(proc.pid, signal.SIGTERM)
@@ -434,12 +455,11 @@ class Pipeline:
             if log.is_file():
                 records['logger_all_head'] = log.read_text(errors='replace').splitlines()[:10]
                 records['build_log'] = str(log.resolve())
-            types = {line.split('=', 1)[1] for lines in caches.values() for line in lines
-                     if line.startswith('CMAKE_BUILD_TYPE:')}
-            if len(types) > 1:
-                dirty = True
-                records['configuration_error'] = 'Mixed build types; cannot infer one reproduction setting.'
-            config = {'build_type': next(iter(types), ''), 'symlink_install': True,
+            package_types = {name: line.split('=', 1)[1] for name, lines in caches.items()
+                             for line in lines if line.startswith('CMAKE_BUILD_TYPE:')}
+            types = set(package_types.values())
+            config = {'build_type': next(iter(types)) if len(types) == 1 else '',
+                      'package_build_types': package_types, 'symlink_install': True,
                       'packages_ignore': [], 'cmake_args': [], 'workers': 2, 'jobs': 2}
             namespace = next((line for line in records.get('logger_all_head', [])
                               if 'Parsed command line arguments:' in line), '')
@@ -475,7 +495,10 @@ class Pipeline:
             atomic_json(p / 'baseline.json', info)
             print(f'Baseline: {p}')
             if dirty:
-                raise PipelineError('Diagnostic snapshot retained; substantive edits or ambiguous settings prevent reproduction.')
+                reasons = [records['configuration_error']] if 'configuration_error' in records else []
+                reasons += [f'{name}: tracked edits or untracked source files'
+                            for name, item in inventory.items() if item['tracked_diff'] or item['untracked']]
+                raise PipelineError('Diagnostic snapshot retained; cannot reproduce: ' + '; '.join(reasons))
         return p
 
     def platform_check(self):
@@ -499,6 +522,8 @@ class Pipeline:
         manifest_load(REPO / 'manifests/humble-bookworm-known-good.repos')
         for verb in ['build', 'test', 'test-result', 'list']:
             text = self.runner.run(['colcon', verb, '--help']).stdout
+            if verb == 'build' and '--metas' not in text:
+                raise PipelineError('Missing colcon metadata extension; run bootstrap.')
             if verb == 'test' and '--return-code-on-test-failure' not in text:
                 raise PipelineError('colcon test extension lacks test-failure exit support.')
         self.runner.run(['/usr/bin/python3', '-c',
@@ -598,6 +623,9 @@ class Pipeline:
                 config.update(workers=self.args.workers, jobs=self.args.jobs)
                 config['packages_ignore'] = sorted(set(config['packages_ignore'] + profile['packages_ignore']))
                 state['config'] = config
+                atomic_json(p / 'metadata/package-build.meta', {'names': {
+                    name: {'cmake-args': [f'-DCMAKE_BUILD_TYPE={value}']}
+                    for name, value in config.get('package_build_types', {}).items()}})
                 state['source_inventory'] = source_inventory(p / 'src', exact)
                 # A baseline's untracked COLCON_IGNORE markers must be represented, not silently lost.
                 if self.args.source == 'baseline':
@@ -633,7 +661,8 @@ class Pipeline:
                 f = p / 'src' / n / name
                 if f.is_file():
                     untracked_hashes[f'{n}/{name}'] = file_hash(f)
-        inputs = ['selected.repos', 'exact.repos', 'profile.json', 'test-exceptions.json', 'source-diff.json']
+        inputs = ['selected.repos', 'exact.repos', 'profile.json', 'test-exceptions.json',
+                  'source-diff.json', 'package-build.meta']
         inputs += [f'mapping-{i}.yaml' for i, _ in enumerate(state['assets']['mappings'])]
         inputs += [f'patch-{i}.diff' for i, _ in enumerate(state['assets']['patches'])]
         metadata = {name: file_hash(p / 'metadata' / name) for name in inputs}
@@ -719,7 +748,8 @@ class Pipeline:
     def colcon_args(self, p, state):
         args = ['--base-paths', str(p / 'src'), '--build-base', str(p / 'build'),
                 '--install-base', str(p / 'install'), '--parallel-workers', str(state['config']['workers']),
-                '--event-handlers', 'console_cohesion+', '--ignore-user-meta', '--metas']
+                '--event-handlers', 'console_cohesion+', '--ignore-user-meta',
+                '--metas', str(p / 'metadata/package-build.meta')]
         if state['config']['packages_ignore']:
             args += ['--packages-ignore', *state['config']['packages_ignore']]
         return args

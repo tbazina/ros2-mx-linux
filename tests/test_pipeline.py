@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 SPEC = importlib.util.spec_from_file_location('pipeline', Path(__file__).resolve().parents[1] / 'scripts/lib/pipeline.py')
 p = importlib.util.module_from_spec(SPEC)
@@ -384,6 +384,8 @@ class LifecycleTests(unittest.TestCase):
         (ws / 'log/latest_build/logger_all.log').write_text("Command line arguments: ['colcon', 'build', '--symlink-install']\n")
         (ws / 'build/fixture_pkg').mkdir(parents=True)
         (ws / 'build/fixture_pkg/CMakeCache.txt').write_text('CMAKE_BUILD_TYPE:STRING=\nBUILD_TESTING:BOOL=ON\n')
+        (ws / 'build/vendor_pkg').mkdir()
+        (ws / 'build/vendor_pkg/CMakeCache.txt').write_text('CMAKE_BUILD_TYPE:STRING=RelWithDebInfo\n')
         before = {str(x.relative_to(ws)): x.read_bytes() for x in ws.rglob('*') if x.is_file()}
         self.args.workspace = ws
         baseline = self.pipe.baseline()
@@ -394,6 +396,10 @@ class LifecycleTests(unittest.TestCase):
         self.args.baseline = baseline
         candidate = self.prepared()
         self.assertEqual(p.read_json(candidate / 'metadata/state.json')['config']['build_type'], '')
+        self.assertEqual(p.read_json(baseline / 'baseline.json')['config']['package_build_types'],
+                         {'fixture_pkg': '', 'vendor_pkg': 'RelWithDebInfo'})
+        self.assertEqual(p.read_json(candidate / 'metadata/package-build.meta')['names']['vendor_pkg'],
+                         {'cmake-args': ['-DCMAKE_BUILD_TYPE=RelWithDebInfo']})
         self.assertFalse(any(a[0] == 'sudo' for a, _, _ in self.runner.calls))
         (ws / 'src/fixture/repo/source.txt').write_text('modified baseline')
         with self.assertRaisesRegex(p.PipelineError, 'Diagnostic snapshot retained'):
@@ -410,6 +416,22 @@ class LifecycleTests(unittest.TestCase):
             'install(FILES source.txt DESTINATION share/fixture_pkg)\n')
         command('git', 'add', '.', cwd=self.origin)
         command('git', 'commit', '-m', 'cmake fixture', cwd=self.origin)
+        # Reproduce a package-specific setting while the global setting stays
+        # empty, as in the existing mixed-default Humble installation.
+        baseline = self.base / 'mixed-baseline'
+        baseline.mkdir()
+        revision = command('git', 'rev-parse', 'HEAD', cwd=self.origin)
+        p.manifest_write(baseline / 'exact.repos', {'fixture/repo': {
+            'type': 'git', 'url': str(self.origin), 'version': revision}})
+        p.atomic_json(baseline / 'baseline.json', {
+            'workspace': str(self.base / 'original-install'), 'reproducible': True,
+            'exact_sha256': p.file_hash(baseline / 'exact.repos'), 'exclusions': [],
+            'repositories': {'fixture/repo': {'revision': revision, 'url': str(self.origin)}},
+            'config': {'build_type': '', 'package_build_types': {'fixture_pkg': 'RelWithDebInfo'},
+                       'symlink_install': True, 'packages_ignore': [], 'cmake_args': []}})
+        self.args.source = 'baseline'
+        self.args.baseline = baseline
+        self.args.manifest = None
         original = self.runner.run
         real_runner = p.Runner(self.home)
         def hybrid(args, **kwargs):
@@ -421,6 +443,8 @@ class LifecycleTests(unittest.TestCase):
             return original(args, **kwargs)
         self.runner.run = hybrid
         candidate = self.built()
+        self.assertRegex((candidate / 'build/fixture_pkg/CMakeCache.txt').read_text(),
+                         r'CMAKE_BUILD_TYPE:[^=\n]+=RelWithDebInfo')
         self.pipe.validate()
         summary = p.read_json(candidate / 'metadata/tests.json')
         self.assertGreater(summary['testcases'], 0)
@@ -567,6 +591,35 @@ class ParserAndReportTests(unittest.TestCase):
             self.assertEqual(caught.exception.returncode, 7)
             result = runner.run(['/bin/sleep', '10'], timeout=0.01, check=False)
             self.assertEqual(result.returncode, 124)
+
+    def test_sudo_authentication_keeps_terminal_and_does_not_log_password(self):
+        runner = p.Runner(self.base)
+        proc = Mock()
+        proc.wait.return_value = 0
+        with patch.object(p.subprocess, 'run', return_value=subprocess.CompletedProcess(['sudo', '-v'], 0)) as auth:
+            with patch.object(p.subprocess, 'Popen', return_value=proc) as spawn:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    runner.run(['sudo', 'apt-get', 'update'])
+        self.assertEqual(auth.call_args.args[0], ['sudo', '-v'])
+        self.assertNotIn('start_new_session', auth.call_args.kwargs)
+        self.assertNotIn('stdout', auth.call_args.kwargs)
+        self.assertEqual(spawn.call_args.args[0], ['sudo', '-n', 'apt-get', 'update'])
+        self.assertFalse(spawn.call_args.kwargs['start_new_session'])
+
+    def test_failed_sudo_authentication_does_not_run_apt(self):
+        with patch.object(p.subprocess, 'run', return_value=subprocess.CompletedProcess(['sudo', '-v'], 1)):
+            with patch.object(p.subprocess, 'Popen') as spawn:
+                with self.assertRaises(p.CommandError):
+                    p.Runner(self.base).run(['sudo', 'apt-get', 'update'])
+        spawn.assert_not_called()
+
+    def test_terminal_attached_cleanup_never_signals_callers_process_group(self):
+        proc = Mock()
+        proc.poll.return_value = None
+        with patch.object(p.os, 'killpg') as killpg:
+            p.Runner.stop(proc, group=False)
+        proc.terminate.assert_called_once()
+        killpg.assert_not_called()
 
     def test_smoke_success_failure_timeout_and_cleanup(self):
         class Process:

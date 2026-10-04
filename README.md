@@ -15,7 +15,8 @@ The kernel is recorded, not constrained. No systemd service is needed.
 
 Run from this repository as your normal user. Scripts create clean subprocess
 environments; do not source the scripts themselves. `sudo` is used only for apt
-and first-time rosdep initialization.
+and first-time rosdep initialization. Run package-installing stages from an
+interactive terminal; sudo requests your password there before logging commands.
 
 Capture the working installation **before** installing or updating dependencies:
 
@@ -85,8 +86,10 @@ CMake settings, installed package names, and `COLCON_IGNORE` paths.
 Capture does not source, test, fetch, or modify the original installation.
 Generated Python bytecode is recorded separately. Substantive edits produce a
 retained diagnostic snapshot but block reproduction; preserve/review those
-changes yourself. Unsupported build selections, merged installation layouts,
-or ambiguous settings also require an explicit compatibility adjustment.
+changes yourself. Different per-package CMake build types are preserved in
+candidate-local colcon metadata (vendor defaults can legitimately differ).
+Unsupported build selections, merged installation layouts, or missing settings
+still require an explicit compatibility adjustment; the error names the cause.
 
 A baseline is **observed and user-reported working**, not independently validated.
 The pipeline always enables tests when rebuilding it. Source revisions alone
@@ -148,7 +151,7 @@ import. No later stage pulls sources.
 
 New upstream/custom candidates default to Release, tests enabled, system Python,
 isolated package installations, and `--symlink-install`. Baseline candidates reuse
-evidenced build type/CMake arguments and package exclusions, with system Python
+evidenced per-package build types/CMake arguments and package exclusions, with system Python
 and testing explicitly enforced. The default is two package workers and two
 compiler jobs per package. Set concurrency **when preparing**:
 
