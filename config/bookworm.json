@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "skip_keys": {
+    "fastcdr": "Built from the selected Humble source manifest.",
+    "rti-connext-dds-6.0.1": "Optional proprietary middleware; Fast DDS and Cyclone DDS are required instead.",
+    "urdfdom_headers": "Built from the selected Humble source manifest.",
+    "python3-vcstool": "Debian Bookworm provides this tool in the verified vcstool package."
+  },
+  "local_rosdep_mappings": [],
+  "packages_ignore": [],
+  "patches": []
+}
