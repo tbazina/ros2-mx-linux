@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "scope": "local",
   "lint_tests": [
     "test_flake8",
@@ -41,5 +41,110 @@
       "reason": "Default-interface multicast is outside local certification; loopback DDS checks remain mandatory."
     }
   ],
-  "cyclone_config": "cyclonedds-loopback.xml"
+  "cyclone_config": "cyclonedds-loopback.xml",
+  "local_tests": {
+    "rcl": {
+      "patterns": [
+        "^test_init__{rmw}$",
+        "^test_node__{rmw}$",
+        "^test_graph__{rmw}$",
+        "^test_client__{rmw}$",
+        "^test_publisher__{rmw}$",
+        "^test_subscription__{rmw}$",
+        "^test_get_actual_qos__{rmw}$"
+      ],
+      "middleware": true
+    },
+    "rclcpp": {
+      "patterns": [
+        "^test_node$",
+        "^test_executor$",
+        "^test_publisher$",
+        "^test_subscription$",
+        "^test_qos$",
+        "^test_parameter_service$"
+      ],
+      "middleware": true
+    },
+    "rclpy": {
+      "patterns": [
+        "^test_node$",
+        "^test_executor$",
+        "^test_publisher$",
+        "^test_subscription$",
+        "^test_qos$",
+        "^test_client$",
+        "^test_action_client$",
+        "^test_action_server$"
+      ],
+      "middleware": true
+    },
+    "test_rclcpp": {
+      "patterns": [
+        "^test_node_name__{rmw}$",
+        "^test_n_nodes__{rmw}$",
+        "^test_services_cpp__{rmw}$"
+      ],
+      "middleware": true
+    },
+    "test_communication": {
+      "patterns": [
+        "^test_publisher_subscriber__rclcpp__rclpy__{rmw}$",
+        "^test_publisher_subscriber__rclpy__rclcpp__{rmw}$",
+        "^test_requester_replier__rclcpp__rclpy__{rmw}$",
+        "^test_requester_replier__rclpy__rclcpp__{rmw}$",
+        "^test_action_client_server__rclcpp__rclpy__{rmw}$",
+        "^test_action_client_server__rclpy__rclcpp__{rmw}$"
+      ],
+      "middleware": true
+    },
+    "rcl_logging_spdlog": {
+      "patterns": [
+        "^test_logging_interface$"
+      ],
+      "middleware": false
+    },
+    "tf2": {
+      "patterns": [
+        "^test_simple_tf2_core$",
+        "^test_cache_unittest$"
+      ],
+      "middleware": false
+    },
+    "tf2_py": {
+      "patterns": [
+        "^tf2_py_test$"
+      ],
+      "middleware": true
+    },
+    "tf2_ros": {
+      "patterns": [
+        "^test_buffer$",
+        "^test_buffer_client$",
+        "^test_buffer_server$"
+      ],
+      "middleware": true
+    },
+    "rosbag2_cpp": {
+      "patterns": [
+        "^test_sequential_reader$",
+        "^test_sequential_writer$"
+      ],
+      "middleware": true
+    },
+    "rosbag2_py": {
+      "patterns": [
+        "^test_sequential_reader_py$",
+        "^test_sequential_writer_py$"
+      ],
+      "middleware": true
+    },
+    "rosbag2_transport": {
+      "patterns": [
+        "^test_record__{rmw}$",
+        "^test_play__{rmw}$"
+      ],
+      "middleware": true
+    }
+  }
 }

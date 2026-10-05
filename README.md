@@ -154,13 +154,31 @@ import. No later stage pulls sources.
 New upstream/custom candidates default to Release, tests enabled, system Python,
 isolated package installations, and `--symlink-install`. Baseline candidates reuse
 evidenced per-package build types/CMake arguments and package exclusions, with system Python
-and testing explicitly enforced. Builds default to two package workers and two
-compiler jobs per package. Validation runs one package and one CTest job at a time
+and testing explicitly enforced. Fresh upstream/custom builds default to two package workers and three
+compiler jobs per package. Baseline reproduction retains recorded concurrency unless
+you explicitly override it. Validation runs one package and one CTest job at a time
 to prevent test interference. Set concurrency **when preparing**:
 
 ```bash
-./scripts/ros2_humble.sh run --source upstream --workers 2 --jobs 2
+./scripts/ros2_humble.sh run --source upstream --workers 2 --jobs 3
 ```
+
+Compiler caching is optional and helps repeated builds after the cache is populated:
+
+```bash
+./scripts/bootstrap_ros2_humble.sh --ccache
+./scripts/ros2_humble.sh run --source upstream --ccache
+# Or prepare --ccache after bootstrap, then deps/build/validate separately.
+```
+
+Only an explicit `--ccache` request installs/enables ccache. It uses CMake compiler
+launchers, a shared `<root>/cache/ccache` directory, content-based compiler checking,
+and candidate-local configuration without unsafe cache settings. Launcher/compiler
+identity and paths are recorded build inputs. Changing build settings requires a
+fresh candidate; existing two-job candidates remain unchanged. Monitor available
+memory, swapping, and thermal behavior when increasing concurrency. `metadata/build-timing.json`
+records resource observations, package timings, and cache statistics; no particular
+speedup is guaranteed. See [ccache documentation](https://ccache.dev/manual/4.8.html).
 
 Candidates keep independent sources, build/install trees, logs, and metadata:
 
@@ -178,60 +196,73 @@ and build tree: a symlink installation is not a standalone relocatable artifact.
 
 ### Validate
 
-Validation certifies **local ROS use**. It requires fresh CTest/JUnit reports,
-nonzero executed coverage, successful package test tasks, and
-`colcon test-result --verbose`. Missing/malformed reports, unexpected unexecuted
-tests, aborted jobs, infrastructure errors, crashes, and runtime failures block
-activation. Explicit benchmark skips and configured disabled tests are reported
-as such; they do not count as executed coverage.
-
-All tests run, including lint/style/type checks. Recognized lint failures default
-to warnings, identified by exact test names or configured CTest labels. Runtime
-tests in lint packages remain blocking. Choose strict lint gating explicitly:
+Validation certifies **localhost use only**. The default `local` mode runs selected
+core ROS, graph, QoS, services, actions, logging, TF2, and rosbag2 tests. Required
+runtime tests run under Fast DDS and Cyclone DDS where applicable. The fixed,
+anchored allowlist is in `config/validation.json`; missing required tests block
+validation instead of silently expanding or shrinking coverage.
 
 ```bash
-./scripts/ros2_humble.sh validate --candidate "$CANDIDATE" --lint-policy strict
+./scripts/ros2_humble.sh validate --candidate "$CANDIDATE"
+./scripts/ros2_humble.sh validate --candidate "$CANDIDATE" --validation-mode full
 ```
 
-The checked-in `config/validation.json` defines classification and local scope.
-It identifies one known default-interface `ros2multicast` assertion as network-only,
-matching its exact test, source revision, and failure prefix. That failure is
-reported as a warning for local certification. Other failures in that package,
-changed revisions, missing results, and infrastructure errors remain blocking.
-LAN multicast/discovery is not certified by passing localhost checks.
+Full mode runs all discovered package tests, including native DDS tests. Neither
+mode certifies LAN connectivity. Passing local mode does not resolve failures in
+omitted upstream tests; previous full-suite reports remain in the candidate logs.
+RViz/rqt and hardware behavior require optional manual checks.
 
-Package tests use separate reserved ROS domains, private ROS logs/cache paths,
-and `ROS_LOCALHOST_ONLY=1`. Native Cyclone tests use the recorded
-`config/cyclonedds-loopback.xml`, since native DDS tests bypass ROS settings.
-The profile explicitly selects loopback and enables its multicast support without
-changing host interface flags or firewall rules. Validation runs under a shared
-runtime-root lock. Native Cyclone tests with hard-coded domain-0 ports require
-those ports to be unused; stop your own domain-0 nodes before retrying if warned.
+| Setting | Local default | Full default |
+|---|---|---|
+| Lint/type-check policy | `skip` | `warn` |
+| Package-test budget | 1,800 seconds | 7,200 seconds |
+| Per-invocation limit | 300 seconds | 900 seconds |
+| Package/CTest concurrency | One | One |
 
-Required packages include ROS CLI, demos, both DDS implementations, RViz, rqt,
-and action tutorials. Smoke checks require C++ → Python and Python → C++ pub/sub,
-daemon-free discovery, a correct service response, and an action result under
-both `rmw_fastrtps_cpp` and `rmw_cyclonedds_cpp`. Each check has a 30-second limit.
-Only owned processes and detached daemon descendants carrying the validation
-attempt token are terminated.
-
-The full package test stage defaults to two hours, separate from smoke checks:
+`--lint-policy skip` omits only exact recognized tests or configured lint labels;
+a pytest subprocess plugin records exact deselected items. `warn` still runs lint
+and converts identifiable reported failures to warnings; `strict` makes those
+failures blocking. Runtime tests in lint packages, collection errors, crashes,
+missing results, and timeouts remain blocking.
 
 ```bash
 ./scripts/ros2_humble.sh validate --candidate "$CANDIDATE" \
-  --lint-policy warn --test-timeout 7200
+  --validation-mode full --lint-policy strict --test-timeout 7200 --package-timeout 900
 ```
 
-Each attempt retains policy/configuration/exception snapshots, CTest inventory,
-colcon events, raw results, tests.json, and smoke.json below `logs/validation-<id>/`.
-The latest summaries also appear in `metadata/tests.json` and `metadata/smoke.json`,
-even on test failure. Smoke checks still run when package tests fail. Readiness
-requires all blocking outcomes to pass; diagnostic checks cannot replace validation.
-See [colcon test options](https://colcon.readthedocs.io/en/released/reference/verb/test.html).
+The eight bounded DDS smoke checks run **before** expensive package tests: C++ →
+Python and Python → C++ pub/sub, daemon-free discovery, correct service response,
+and action result for both implementations. Each check has a 30-second limit.
+ROS CLI, demos, both DDS implementations, RViz, rqt, and action tutorials must be
+installed. Full-mode preflight also checks native Cyclone's hard-coded domain-0
+ports; occupied ports and identifiable owners are reported without stopping them.
 
-After activation, optionally check `ros2 run rviz2 rviz2`,
-`ros2 run rqt_gui rqt_gui`, and your hardware/application workflows on the MX
-desktop. These manual checks are not automatic activation gates.
+Package invocations use reserved domains **20–100**, private logs/cache directories,
+and `ROS_LOCALHOST_ONLY=1`. Logging tests instead get a temporary `HOME` with
+`ROS_HOME` and `ROS_LOG_DIR` unset, preserving their environment-manipulation tests.
+Native Cyclone tests use the recorded loopback configuration, without changing
+host interfaces or firewall rules. Only validator-owned processes and daemons
+carrying the attempt token are cleaned up. Validation runs under a shared root lock.
+
+Local mode stops after the first blocking package result; full mode continues
+collecting failures. Readiness requires fresh reports, nonzero executed coverage,
+correct stage outcomes, and no blocking results. Legitimate benchmark skips and
+configured disabled tests are recorded separately from intentionally unselected
+tests. The exact revision-bound default-interface `ros2multicast` assertion remains
+a visible network-only warning; general communication failures are never waived.
+
+Each `logs/validation-<id>/` retains the execution plan, preflight, policies,
+exceptions, CTest inventory, invocation commands/environments, middleware-separated
+report snapshots, pytest item evidence, `tests.json`, `smoke.json`, and timings.
+Latest summaries also appear in `metadata/`, including on failure. Use `status`
+for stage durations and the slowest build/test invocations. GUI checks are manual:
+
+```bash
+ros2 run rviz2 rviz2
+ros2 run rqt_gui rqt_gui
+```
+
+See [colcon test options](https://colcon.readthedocs.io/en/main/reference/verb/test.html).
 
 ### Activate and roll back
 
@@ -239,8 +270,8 @@ Activation is allowed only after validation passes and the recorded source,
 configuration, and installed-package fingerprints still match. Package checking
 is conservative: **any installed Debian package version change** requests a rebuild
 and revalidation. Validation code, policy, exceptions, or network configuration
-changes require revalidation without a ROS rebuild. Activation reports the local
-certification scope and warnings. There is no force-activation option.
+changes require revalidation without a ROS rebuild. Activation reports the validation mode, local
+certification scope, coverage, omitted-test entries, and warnings. There is no force-activation option.
 
 Roll back workspace selection in a fresh terminal:
 
@@ -306,11 +337,34 @@ suite:
 ./scripts/ros2_humble.sh diagnose --candidate "$CANDIDATE" --check-network
 ```
 
-`--check-network` also probes default-interface communication; it is a diagnostic,
-not proof of communication between two machines. Reports go to `logs/diagnose-<id>/`
-and do not change readiness. Known old metadata is migrated only after verifying
-its complete original fingerprint; old validation becomes stale. Unknown or
-changed provenance requires a fresh candidate, without an adoption bypass.
+`--check-network` also probes default-interface communication; it is not proof of
+communication between two machines. Diagnostics save results in `logs/diagnose-<id>/`
+and never grant or replace readiness. Target selected failures without rerunning
+the complete suite:
+
+```bash
+./scripts/ros2_humble.sh diagnose --candidate "$CANDIDATE" \
+  --packages demo_nodes_cpp test_rclcpp test_communication \
+  --ctest-regex '^test_(tutorial_talker_listener|node_name|services_cpp|publisher_subscriber__rclcpp__rclpy|requester_replier__rclcpp__rclpy|action_client_server__rclcpp__rclpy)__rmw_cyclonedds_cpp$' \
+  --compare-cyclone --package-timeout 300
+
+./scripts/ros2_humble.sh diagnose --candidate "$CANDIDATE" \
+  --packages ros2topic --pytest-expression 'test_cli and rmw_fastrtps_dynamic_cpp' \
+  --rmw rmw_fastrtps_dynamic_cpp --package-timeout 300
+
+./scripts/ros2_humble.sh diagnose --candidate "$CANDIDATE" \
+  --packages rcl_logging_spdlog --ctest-regex '^test_logging_interface$'
+```
+
+`--compare-cyclone` compares the usual localhost environment with explicit loopback
+multicast. The second diagnostic variant disables RMW's automatic localhost interface
+injection to avoid duplicate interface definitions, but requires loopback-only XML
+with no remote peers. It does **not** change certification settings. No new general
+Cyclone workaround is enabled without a successful live reproduction.
+
+Known old metadata is migrated only after verifying its complete original
+fingerprint; old validation becomes stale. Unknown or changed provenance requires
+a fresh candidate, without an adoption bypass.
 
 Validator-only fixes allow reuse of an unchanged built candidate:
 

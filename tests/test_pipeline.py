@@ -90,6 +90,13 @@ class FakeRunner(p.Runner):
                 (base / package / 'test.xml').write_text(
                     f'<testsuite tests="1" failures="{int(self.test_failure)}">'
                     f'<testcase classname="fixture" name="{self.test_name}">{fail}</testcase></testsuite>')
+                if '--ctest-args' in args:
+                    status = 'failed' if self.test_failure else 'passed'
+                    (base / package / 'Test.xml').write_text(
+                        f'<Site><Testing><Test Status="{status}"><Name>{self.test_name}</Name>'
+                        '<FullCommandLine>test.xml</FullCommandLine><Results>'
+                        '<NamedMeasurement name="Completion Status"><Value>Completed</Value>'
+                        '</NamedMeasurement></Results></Test></Testing></Site>')
         elif args[:2] == ['colcon', 'test-result']:
             code = int(self.test_failure)
         elif args[:3] == ['ros2', 'pkg', 'list']:
@@ -129,6 +136,12 @@ class LifecycleTests(unittest.TestCase):
         self.args = p.parser().parse_args(['prepare', '--root', str(self.base / 'runtime'),
                                          '--source', 'manifest', '--manifest', str(self.manifest)])
         self.args.test_timeout = 7200
+        # Legacy lifecycle fixtures exercise unrestricted full-mode report gates.
+        # Local profile selectors and defaults are covered in test_local_pipeline.
+        self.args.validation_mode = 'full'
+        self.args.lint_policy = 'warn'
+        self.port_guard = patch.object(p, 'native_port_conflicts', return_value=[])
+        self.port_guard.start()
         profile = p.read_json(p.REPO / 'config/bookworm.json')
         profile['patches'] = []
         self.args.profile = self.base / 'bookworm.json'
@@ -139,6 +152,7 @@ class LifecycleTests(unittest.TestCase):
         self.quiet.__enter__()
 
     def tearDown(self):
+        self.port_guard.stop()
         self.quiet.__exit__(None, None, None)
         self.tmp.cleanup()
 

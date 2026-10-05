@@ -203,7 +203,7 @@ class LifecycleValidationTests(unittest.TestCase):
         fx.runner.run = timeout
         with self.assertRaises(p.PipelineError):
             fx.pipe.validate()
-        self.assertIn('Full-test timeout', str(p.read_json(candidate / 'metadata/tests.json')['infrastructure']))
+        self.assertIn('timeout while running', str(p.read_json(candidate / 'metadata/tests.json')['infrastructure']))
         self.assertEqual(len(p.read_json(candidate / 'metadata/smoke.json')), 8)
 
     def test_incomplete_smoke_matrix_blocks_activation(self):
